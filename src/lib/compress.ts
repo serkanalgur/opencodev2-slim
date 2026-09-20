@@ -10,7 +10,6 @@ async function getTokenizer() {
             const mod = await import("@anthropic-ai/tokenizer")
             tokenizer = mod
         } catch {
-            // Fallback: estimate ~4 chars per token
             return null
         }
     }
@@ -40,9 +39,8 @@ export function getMessageText(msg: MessageWithParts): string {
 
     for (const part of msg.parts) {
         if (part.type === "text") {
-            const textPart = part as any
-            if (textPart.text) {
-                texts.push(textPart.text)
+            if (part.text) {
+                texts.push(part.text)
             }
         }
     }
@@ -54,10 +52,15 @@ export function getToolResultContent(msg: MessageWithParts): string {
     const results: string[] = []
 
     for (const part of msg.parts) {
-        if (part.type === "tool") {
-            const toolPart = part as any
-            if (toolPart.state?.type === "result" && toolPart.state?.output) {
-                results.push(String(toolPart.state.output).slice(0, 500))
+        // v1 SDK format: type === "tool"
+        if (part.type === "tool" && part.state?.type === "result" && part.state?.output) {
+            results.push(String(part.state.output).slice(0, 500))
+        }
+        // v2 AI format: type === "tool-result"
+        if (part.type === "tool-result" && part.result) {
+            const val = part.result.value
+            if (val !== undefined && val !== null) {
+                results.push(String(val).slice(0, 500))
             }
         }
     }
@@ -67,9 +70,13 @@ export function getToolResultContent(msg: MessageWithParts): string {
 
 export function getToolName(msg: MessageWithParts): string | null {
     for (const part of msg.parts) {
+        // v1 SDK format
         if (part.type === "tool") {
-            const toolPart = part as any
-            return toolPart.tool || null
+            return part.tool || null
+        }
+        // v2 AI format
+        if (part.type === "tool-call") {
+            return part.name || null
         }
     }
     return null
@@ -96,7 +103,6 @@ export function shouldCompress(
 
     // Soft limit: recommend compression
     if (currentTokens >= minTokens) {
-        // Check if enough time has passed since last compression
         if (minutesSinceLast >= nudgeFrequency) {
             return {
                 compress: true,

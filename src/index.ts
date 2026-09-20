@@ -43,17 +43,21 @@ function buildCompressionSummary(messages: MessageWithParts[], focus: string): s
 
     for (const msg of messages) {
         for (const part of msg.parts) {
-            if (part.type === "tool") {
+            if (part.type === "tool-call") {
                 const toolPart = part as any
                 toolCalls.push(
-                    `${toolPart.tool}: ${JSON.stringify(toolPart.state?.input || {}).slice(0, 100)}`,
+                    `${toolPart.name}: ${JSON.stringify(toolPart.input || {}).slice(0, 100)}`,
                 )
-                if (toolPart.state?.status === "error") {
-                    errors.push(toolPart.state.error?.slice(0, 200) || "Unknown error")
+            }
+            if (part.type === "tool-result") {
+                const toolPart = part as any
+                if (toolPart.result?.type === "error") {
+                    errors.push(String(toolPart.result.value).slice(0, 200) || "Unknown error")
                 }
             }
             if (part.type === "text") {
-                const text = (part as any).text
+                const textPart = part as any
+                const text = textPart.text || ""
                 if (
                     text.includes("decided") ||
                     text.includes("chose") ||
@@ -86,22 +90,23 @@ function buildCompressionSummary(messages: MessageWithParts[], focus: string): s
     return lines.join("\n")
 }
 
+function wrapAsMessageWithParts(msg: any): MessageWithParts {
+    return {
+        info: msg.info || { id: msg.id || "", role: msg.role, sessionID: "", time: { created: Date.now() } },
+        parts: msg.parts || msg.content || [],
+    }
+}
+
 // ─── Plugin Entry ───────────────────────────────────────────────────────────
 
 export default Plugin.define({
     id: "opencodev2-slim",
     async setup(ctx) {
-        // Load and create default config if needed
         createDefaultConfig()
         const globalConfig = loadConfig()
 
         // ─── Register Compress Tool ───────────────────────────────────────
         await ctx.tool.transform((editor) => {
-            editor.namespace({
-                name: "slim",
-                description: "Smart context management tools",
-            })
-
             editor.add({
                 name: "compress",
                 description: getCompressToolDescription(),
@@ -150,9 +155,7 @@ export default Plugin.define({
                     }
                     const mode = args.mode || "auto"
                     const keepRecent = args.keepRecent || 5
-
-                    // Get session ID from context or fallback
-                    const sessionId = (context as any).sessionID || ""
+                    const sessionId = context.sessionID
                     const config = getConfig(sessionId)
                     const state = getState(sessionId, config)
 
@@ -163,12 +166,10 @@ export default Plugin.define({
                             return { content: "No messages found in session" }
                         }
 
-                        const messageWithParts: MessageWithParts[] = messages.map((m: any) => ({
-                            info: m.info || m,
-                            parts: m.parts || [],
-                        }))
+                        const messageWithParts: MessageWithParts[] = messages.map(
+                            (m: any) => wrapAsMessageWithParts(m),
+                        )
 
-                        // Determine what to compress
                         let targetIndices: number[] = []
                         let inputTokens = 0
 
@@ -193,7 +194,6 @@ export default Plugin.define({
                                 }
                             }
                         } else {
-                            // Auto mode
                             for (let i = 0; i < messageWithParts.length - keepRecent; i++) {
                                 const msg = messageWithParts[i]
                                 const text = getMessageText(msg) + getToolResultContent(msg)
@@ -210,7 +210,6 @@ export default Plugin.define({
 
                         const targetMessages = targetIndices.map((i) => messageWithParts[i])
                         const summary = buildCompressionSummary(targetMessages, args.focus)
-
                         const outputTokens = await countTokens(summary)
                         const ratio = inputTokens > 0 ? 1 - outputTokens / inputTokens : 0
 
@@ -256,7 +255,7 @@ export default Plugin.define({
                     additionalProperties: false,
                 },
                 execute: async (_input, context) => {
-                    const sessionId = (context as any).sessionID || ""
+                    const sessionId = context.sessionID
                     const config = getConfig(sessionId)
                     const state = getState(sessionId, config)
 
@@ -267,23 +266,18 @@ export default Plugin.define({
                             return { content: "No messages found in session" }
                         }
 
-                        const messageWithParts: MessageWithParts[] = messages.map((m: any) => ({
-                            info: m.info || m,
-                            parts: m.parts || [],
-                        }))
-
-                        const modelId = (context as any).model?.id || "unknown"
+                        const messageWithParts: MessageWithParts[] = messages.map(
+                            (m: any) => wrapAsMessageWithParts(m),
+                        )
 
                         const panelData = await buildPanelData(
                             sessionId,
                             messageWithParts,
                             state,
                             config,
-                            modelId,
                         )
 
                         const panel = renderPanel(panelData)
-
                         return { content: panel }
                     } catch (error) {
                         return {
@@ -294,92 +288,85 @@ export default Plugin.define({
             })
         })
 
-        // ─── System Prompt Hook ──────────────────────────────────────────
+        // ─── System Prompt Hook (sync) ───────────────────────────────────
         await ctx.session.hook("context", (event) => {
-            const sessionId = (event as any).sessionID || ""
+            const sessionId = event.sessionID
             const config = getConfig(sessionId)
-            if (!config.enabled || !config.compress.enabled) {
-                return
-            }
+            if (!config.enabled || !config.compress.enabled) return
 
             const state = getState(sessionId, config)
+            state.modelContextLimit = 200000 // default; updated by tool calls
 
-            // Track model context limit
-            if ((event as any).model?.limit?.context) {
-                state.modelContextLimit = (event as any).model.limit.context
-            }
-
-            // Add system prompt
-            const systemPrompt = getSystemPrompt()
-            event.system.push({ type: "text", text: systemPrompt })
+            event.system.push({ type: "text", text: getSystemPrompt() })
         })
 
-        // ─── Messages Transform Hook ─────────────────────────────────────
-        await ctx.session.hook("context", async (event) => {
-            const config = getConfig("")
-            if (!config.enabled) {
-                return
-            }
+        // ─── Messages Transform Hook (sync) ──────────────────────────────
+        await ctx.session.hook("context", (event) => {
+            const sessionId = event.sessionID
+            const config = getConfig(sessionId)
+            if (!config.enabled) return
 
-            const sessionId = (event as any).sessionID || ""
             const state = getState(sessionId, config)
 
-            // Apply pruning strategies to messages
-            if (event.messages && Array.isArray(event.messages)) {
-                const prunedMessages = pruneMessages(
-                    event.messages as any,
-                    config,
-                    event.messages.length,
-                )
+            // Apply pruning strategies
+            const pruned = pruneMessages(
+                event.messages.map((m: any) => wrapAsMessageWithParts(m)),
+                config,
+                event.messages.length,
+            )
 
-                // Replace messages
-                event.messages.length = 0
-                event.messages.push(...(prunedMessages as any))
+            // Replace messages in-place
+            event.messages.length = 0
+            for (const msg of pruned) {
+                event.messages.push(msg as any)
+            }
 
-                // Check if compression nudge is needed
-                let totalTokens = 0
-                for (const msg of event.messages) {
-                    const text = getMessageText(msg as any) + getToolResultContent(msg as any)
-                    totalTokens += await countTokens(text)
+            // Quick token estimate (sync, ~4 chars per token)
+            let totalTokens = 0
+            for (const msg of event.messages) {
+                const content = (msg as any).content
+                if (Array.isArray(content)) {
+                    for (const part of content) {
+                        if (part.type === "text" && part.text) {
+                            totalTokens += Math.ceil(part.text.length / 4)
+                        }
+                    }
                 }
+            }
 
-                state.currentTokenCount = totalTokens
+            state.currentTokenCount = totalTokens
 
-                const maxTokens = resolveTokenLimit(
-                    config.compress.maxContextLimit,
-                    state.modelContextLimit,
-                )
-                const minTokens = resolveTokenLimit(
-                    config.compress.minContextLimit,
-                    state.modelContextLimit,
-                )
+            const maxTokens = resolveTokenLimit(
+                config.compress.maxContextLimit,
+                state.modelContextLimit,
+            )
+            const minTokens = resolveTokenLimit(
+                config.compress.minContextLimit,
+                state.modelContextLimit,
+            )
 
-                const shouldComp = shouldCompress(
+            const shouldComp = shouldCompress(
+                totalTokens,
+                maxTokens,
+                minTokens,
+                state.lastCompressionTime,
+                config.compress.nudgeFrequency,
+                event.messages.length,
+            )
+
+            if (shouldComp.compress && !state.manualMode) {
+                const nudgeMessage = getNudgeMessage(
+                    shouldComp.reason,
                     totalTokens,
                     maxTokens,
-                    minTokens,
-                    state.lastCompressionTime,
-                    config.compress.nudgeFrequency,
-                    event.messages.length,
                 )
-
-                if (shouldComp.compress && !state.manualMode) {
-                    const nudgeMessage = getNudgeMessage(
-                        shouldComp.reason,
-                        totalTokens,
-                        maxTokens,
-                    )
-                    event.messages.push({
-                        info: {
-                            role: "assistant",
-                            sessionID: sessionId,
-                        } as any,
-                        parts: [{ type: "text", text: nudgeMessage }],
-                    } as any)
-                }
-
-                saveSessionState(state, config.persistence.directory)
+                event.messages.push({
+                    role: "assistant",
+                    content: [{ type: "text", text: nudgeMessage }],
+                } as any)
             }
+
+            saveSessionState(state, config.persistence.directory)
         })
 
         // ─── Event Subscription ──────────────────────────────────────────
@@ -387,8 +374,8 @@ export default Plugin.define({
         void (async () => {
             for await (const event of ctx.event.subscribe({ signal: eventController.signal })) {
                 if (event.type === "session.created") {
-                    const properties = (event as any).properties || {}
-                    const sessionId = properties.sessionID || ""
+                    const props = (event as any).properties || {}
+                    const sessionId = props.sessionID || ""
                     const config = getConfig(sessionId)
                     sessionConfigs.set(sessionId, config)
                     getState(sessionId, config)
@@ -399,7 +386,6 @@ export default Plugin.define({
         // ─── Cleanup ─────────────────────────────────────────────────────
         return () => {
             eventController.abort()
-            // Save all states on dispose
             for (const [sessionId, state] of sessionStates.entries()) {
                 const config = getConfig(sessionId)
                 saveSessionState(state, config.persistence.directory)

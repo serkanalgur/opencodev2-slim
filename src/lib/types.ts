@@ -1,4 +1,4 @@
-import type { Message, Part } from "@opencode-ai/sdk/v2"
+import type { Message } from "@opencode-ai/sdk/v2"
 
 // ─── Config Types ───────────────────────────────────────────────────────────
 
@@ -90,7 +90,7 @@ export interface ToolCallInfo {
 
 export interface MessageWithParts {
     info: Message
-    parts: Part[]
+    parts: any[]
 }
 
 export interface CompressionRange {
