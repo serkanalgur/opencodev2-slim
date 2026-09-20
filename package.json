@@ -1,6 +1,6 @@
 {
   "name": "@serkanalgur/opencodev2-slim",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "description": "Smart context management plugin for OpenCode v2 - semantic compression, cost-aware pruning, adaptive thresholds",
   "keywords": [
     "opencode",
@@ -46,10 +46,12 @@
     "jsonc-parser": "^3.3.1"
   },
   "devDependencies": {
+    "@opencode/plugin": "^2.0.0",
+    "@opencode-ai/sdk": "^1.18.29",
     "@opencode-ai/plugin": "^1.18.29",
-    "@opentui/core": "^0.4.5",
-    "@opentui/keymap": "^0.4.5",
-    "@opentui/solid": "^0.4.5",
+    "@opentui/core": "^0.5.10",
+    "@opentui/keymap": "^0.5.10",
+    "@opentui/solid": "^0.5.10",
     "@types/node": "^22.0.0",
     "prettier": "^3.4.0",
     "solid-js": "1.9.12",
@@ -57,13 +59,18 @@
     "typescript": "^5.7.0"
   },
   "peerDependencies": {
+    "@opencode/plugin": ">=2.0.0",
+    "@opencode-ai/sdk": ">=1.18.29",
     "@opencode-ai/plugin": ">=1.18.29",
-    "@opentui/core": ">=0.4.5",
-    "@opentui/keymap": ">=0.4.5",
-    "@opentui/solid": ">=0.4.5",
+    "@opentui/core": ">=0.5.10",
+    "@opentui/keymap": ">=0.5.10",
+    "@opentui/solid": ">=0.5.10",
     "solid-js": ">=1.0.0"
   },
   "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    },
     "@opentui/core": {
       "optional": true
     },

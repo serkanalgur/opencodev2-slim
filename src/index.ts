@@ -1,6 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin"
-import { z } from "zod"
+import { Plugin } from "@opencode/plugin"
 import { loadConfig, createDefaultConfig, resolveTokenLimit } from "./lib/config"
 import {
     loadSessionState,
@@ -30,321 +28,6 @@ function getConfig(sessionId: string): SlimConfig {
     return sessionConfigs.get(sessionId) || loadConfig()
 }
 
-// ─── Plugin Entry ───────────────────────────────────────────────────────────
-
-const server: Plugin = async (ctx) => {
-    // Load and create default config if needed
-    createDefaultConfig()
-    const globalConfig = loadConfig()
-
-    // ─── Compress Tool ─────────────────────────────────────────────────────
-    const compressTool = tool({
-        description: getCompressToolDescription(),
-        args: {
-            focus: z
-                .string()
-                .describe("What to compress (e.g., 'old exploration', 'completed tasks')"),
-            mode: z
-                .enum(["auto", "range", "topic"])
-                .default("auto")
-                .describe("Compression mode"),
-            start: z.number().optional().describe("Start message index (for range mode)"),
-            end: z.number().optional().describe("End message index (for range mode)"),
-            topic: z.string().optional().describe("Topic to compress (for topic mode)"),
-            keepRecent: z.number().default(5).describe("Number of recent messages to always keep"),
-        },
-        async execute(args, context) {
-            const config = getConfig(context.sessionID)
-            const state = getState(context.sessionID, config)
-
-            try {
-                const response = await ctx.client.session.messages({
-                    path: { id: context.sessionID },
-                })
-
-                if (!response.data || response.error) {
-                    return "Failed to fetch messages"
-                }
-
-                const messageList = response.data
-                const messageWithParts: MessageWithParts[] = messageList.map((m) => ({
-                    info: m.info,
-                    parts: m.parts,
-                }))
-
-                // Determine what to compress
-                let targetIndices: number[] = []
-                let inputTokens = 0
-
-                if (args.mode === "range" && args.start !== undefined && args.end !== undefined) {
-                    // Range mode: compress specific range
-                    const start = Math.max(0, args.start)
-                    const end = Math.min(messageWithParts.length, args.end)
-                    for (let i = start; i < end; i++) {
-                        targetIndices.push(i)
-                        const text =
-                            getMessageText(messageWithParts[i]) +
-                            getToolResultContent(messageWithParts[i])
-                        inputTokens += await countTokens(text)
-                    }
-                } else if (args.mode === "topic" && args.topic) {
-                    // Topic mode: compress messages matching topic
-                    const topicLower = args.topic.toLowerCase()
-                    for (let i = 0; i < messageWithParts.length - args.keepRecent; i++) {
-                        const msg = messageWithParts[i]
-                        const text = getMessageText(msg) + getToolResultContent(msg)
-                        if (text.toLowerCase().includes(topicLower)) {
-                            targetIndices.push(i)
-                            inputTokens += await countTokens(text)
-                        }
-                    }
-                } else {
-                    // Auto mode: smart selection
-                    const keepRecent = args.keepRecent
-                    for (let i = 0; i < messageWithParts.length - keepRecent; i++) {
-                        const msg = messageWithParts[i]
-                        const text = getMessageText(msg) + getToolResultContent(msg)
-                        const tokens = await countTokens(text)
-
-                        // Skip if too small to compress
-                        if (tokens < 100) continue
-
-                        targetIndices.push(i)
-                        inputTokens += tokens
-                    }
-                }
-
-                if (targetIndices.length === 0) {
-                    return "Nothing to compress - context is already efficient"
-                }
-
-                // Build summary
-                const targetMessages = targetIndices.map((i) => messageWithParts[i])
-                const summary = buildCompressionSummary(targetMessages, args.focus)
-
-                // Count output tokens
-                const outputTokens = await countTokens(summary)
-                const ratio = inputTokens > 0 ? 1 - outputTokens / inputTokens : 0
-
-                // Record compression
-                addCompressionRecord(
-                    state,
-                    {
-                        timestamp: Date.now(),
-                        inputTokens,
-                        outputTokens,
-                        ratio,
-                        messageCount: targetMessages.length,
-                        success: true,
-                    },
-                    config.adaptive.learningRate,
-                )
-
-                saveSessionState(state, config.persistence.directory)
-
-                return {
-                    title: `Compressed ${targetMessages.length} messages`,
-                    output: summary,
-                    metadata: {
-                        inputTokens,
-                        outputTokens,
-                        ratio: Math.round(ratio * 100) + "%",
-                        mode: args.mode,
-                        focus: args.focus,
-                    },
-                }
-            } catch (error) {
-                return `Error compressing: ${error instanceof Error ? error.message : "Unknown error"}`
-            }
-        },
-    })
-
-    // ─── Panel Tool ────────────────────────────────────────────────────────
-    const panelTool = tool({
-        description: `Display a rich context usage panel showing:
-- Current token usage vs model limit
-- Message breakdown (user/assistant/tools)
-- Token distribution by role
-- Compression history and savings
-- Cost estimate
-- Topic distribution
-- Smart recommendations`,
-        args: {},
-        async execute(_args, context) {
-            const config = getConfig(context.sessionID)
-            const state = getState(context.sessionID, config)
-
-            try {
-                const response = await ctx.client.session.messages({
-                    path: { id: context.sessionID },
-                })
-
-                if (!response.data || response.error) {
-                    return "Failed to fetch messages"
-                }
-
-                const messageList = response.data
-                const messageWithParts: MessageWithParts[] = messageList.map((m) => ({
-                    info: m.info,
-                    parts: m.parts,
-                }))
-
-                // Get model ID from context if available
-                const modelId = (context as any).model?.id || "unknown"
-
-                // Build panel data
-                const panelData = await buildPanelData(
-                    context.sessionID,
-                    messageWithParts,
-                    state,
-                    config,
-                    modelId,
-                )
-
-                // Render panel
-                const panel = renderPanel(panelData)
-
-                return {
-                    title: "Context Panel",
-                    output: panel,
-                    metadata: {
-                        usagePercent: panelData.usagePercent,
-                        status: panelData.status,
-                        currentTokens: panelData.currentTokens,
-                        maxTokens: panelData.maxTokens,
-                    },
-                }
-            } catch (error) {
-                return `Error generating panel: ${error instanceof Error ? error.message : "Unknown error"}`
-            }
-        },
-    })
-
-    // ─── Return Hooks ──────────────────────────────────────────────────────
-    return {
-        config: async (opencodeConfig) => {
-            // Add tool permissions
-            if (!opencodeConfig.permission) {
-                opencodeConfig.permission = {} as any
-            }
-            ;(opencodeConfig.permission as any).compress = globalConfig.compress.permission
-            ;(opencodeConfig.permission as any).panel = "allow"
-        },
-
-        tool: {
-            compress: compressTool,
-            panel: panelTool,
-        },
-
-        "experimental.chat.system.transform": async (input, output) => {
-            const config = getConfig(input.sessionID || "")
-            if (!config.enabled || !config.compress.enabled) {
-                return
-            }
-
-            const state = getState(input.sessionID || "", config)
-
-            // Track model context limit
-            if (input.model?.limit?.context) {
-                state.modelContextLimit = input.model.limit.context
-            }
-
-            // Add system prompt
-            const systemPrompt = getSystemPrompt()
-            if (output.system.length > 0) {
-                output.system[output.system.length - 1] += "\n\n" + systemPrompt
-            } else {
-                output.system.push(systemPrompt)
-            }
-        },
-
-        "experimental.chat.messages.transform": async (input, output) => {
-            const config = getConfig("")
-            if (!config.enabled) {
-                return
-            }
-
-            // Get session ID from first message if available
-            const sessionId = output.messages[0]?.info.sessionID || ""
-            const state = getState(sessionId, config)
-
-            // Apply pruning strategies
-            const prunedMessages = pruneMessages(
-                output.messages as any,
-                config,
-                output.messages.length,
-            )
-
-            // Replace messages
-            output.messages.length = 0
-            output.messages.push(...(prunedMessages as any))
-
-            // Check if compression nudge is needed
-            let totalTokens = 0
-            for (const msg of output.messages) {
-                const text = getMessageText(msg as any) + getToolResultContent(msg as any)
-                totalTokens += await countTokens(text)
-            }
-
-            state.currentTokenCount = totalTokens
-
-            const maxTokens = resolveTokenLimit(
-                config.compress.maxContextLimit,
-                state.modelContextLimit,
-            )
-            const minTokens = resolveTokenLimit(
-                config.compress.minContextLimit,
-                state.modelContextLimit,
-            )
-
-            const shouldComp = shouldCompress(
-                totalTokens,
-                maxTokens,
-                minTokens,
-                state.lastCompressionTime,
-                config.compress.nudgeFrequency,
-                output.messages.length,
-            )
-
-            if (shouldComp.compress && !state.manualMode) {
-                // Inject nudge as a system message
-                const nudgeMessage = getNudgeMessage(
-                    shouldComp.reason,
-                    totalTokens,
-                    maxTokens,
-                )
-                output.messages.push({
-                    info: {
-                        role: "assistant",
-                        sessionID: sessionId,
-                    } as any,
-                    parts: [{ type: "text", text: nudgeMessage }],
-                } as any)
-            }
-
-            saveSessionState(state, config.persistence.directory)
-        },
-
-        event: async (input) => {
-            const event = input.event
-            if (event.type === "session.created") {
-                const sessionId = (event as any).properties?.sessionID || ""
-                const config = getConfig(sessionId)
-                sessionConfigs.set(sessionId, config)
-                getState(sessionId, config)
-            }
-        },
-
-        dispose: async () => {
-            // Save all states on dispose
-            for (const [sessionId, state] of sessionStates.entries()) {
-                const config = getConfig(sessionId)
-                saveSessionState(state, config.persistence.directory)
-            }
-        },
-    }
-}
-
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function buildCompressionSummary(messages: MessageWithParts[], focus: string): string {
@@ -354,7 +37,6 @@ function buildCompressionSummary(messages: MessageWithParts[], focus: string): s
     lines.push(`Messages compressed: ${messages.length}`)
     lines.push("")
 
-    // Extract key information
     const toolCalls: string[] = []
     const errors: string[] = []
     const decisions: string[] = []
@@ -404,4 +86,324 @@ function buildCompressionSummary(messages: MessageWithParts[], focus: string): s
     return lines.join("\n")
 }
 
-export default { id: "opencodev2-slim", server }
+// ─── Plugin Entry ───────────────────────────────────────────────────────────
+
+export default Plugin.define({
+    id: "opencodev2-slim",
+    async setup(ctx) {
+        // Load and create default config if needed
+        createDefaultConfig()
+        const globalConfig = loadConfig()
+
+        // ─── Register Compress Tool ───────────────────────────────────────
+        await ctx.tool.transform((editor) => {
+            editor.namespace({
+                name: "slim",
+                description: "Smart context management tools",
+            })
+
+            editor.add({
+                name: "compress",
+                description: getCompressToolDescription(),
+                input: {
+                    type: "object",
+                    properties: {
+                        focus: {
+                            type: "string",
+                            description: "What to compress (e.g., 'old exploration', 'completed tasks')",
+                        },
+                        mode: {
+                            type: "string",
+                            enum: ["auto", "range", "topic"],
+                            default: "auto",
+                            description: "Compression mode",
+                        },
+                        start: {
+                            type: "number",
+                            description: "Start message index (for range mode)",
+                        },
+                        end: {
+                            type: "number",
+                            description: "End message index (for range mode)",
+                        },
+                        topic: {
+                            type: "string",
+                            description: "Topic to compress (for topic mode)",
+                        },
+                        keepRecent: {
+                            type: "number",
+                            default: 5,
+                            description: "Number of recent messages to always keep",
+                        },
+                    },
+                    required: ["focus"],
+                    additionalProperties: false,
+                },
+                execute: async (input, context) => {
+                    const args = input as {
+                        focus: string
+                        mode?: string
+                        start?: number
+                        end?: number
+                        topic?: string
+                        keepRecent?: number
+                    }
+                    const mode = args.mode || "auto"
+                    const keepRecent = args.keepRecent || 5
+
+                    // Get session ID from context or fallback
+                    const sessionId = (context as any).sessionID || ""
+                    const config = getConfig(sessionId)
+                    const state = getState(sessionId, config)
+
+                    try {
+                        const messages = await ctx.session.context({ sessionID: sessionId })
+
+                        if (!messages || messages.length === 0) {
+                            return { content: "No messages found in session" }
+                        }
+
+                        const messageWithParts: MessageWithParts[] = messages.map((m: any) => ({
+                            info: m.info || m,
+                            parts: m.parts || [],
+                        }))
+
+                        // Determine what to compress
+                        let targetIndices: number[] = []
+                        let inputTokens = 0
+
+                        if (mode === "range" && args.start !== undefined && args.end !== undefined) {
+                            const start = Math.max(0, args.start)
+                            const end = Math.min(messageWithParts.length, args.end)
+                            for (let i = start; i < end; i++) {
+                                targetIndices.push(i)
+                                const text =
+                                    getMessageText(messageWithParts[i]) +
+                                    getToolResultContent(messageWithParts[i])
+                                inputTokens += await countTokens(text)
+                            }
+                        } else if (mode === "topic" && args.topic) {
+                            const topicLower = args.topic.toLowerCase()
+                            for (let i = 0; i < messageWithParts.length - keepRecent; i++) {
+                                const msg = messageWithParts[i]
+                                const text = getMessageText(msg) + getToolResultContent(msg)
+                                if (text.toLowerCase().includes(topicLower)) {
+                                    targetIndices.push(i)
+                                    inputTokens += await countTokens(text)
+                                }
+                            }
+                        } else {
+                            // Auto mode
+                            for (let i = 0; i < messageWithParts.length - keepRecent; i++) {
+                                const msg = messageWithParts[i]
+                                const text = getMessageText(msg) + getToolResultContent(msg)
+                                const tokens = await countTokens(text)
+                                if (tokens < 100) continue
+                                targetIndices.push(i)
+                                inputTokens += tokens
+                            }
+                        }
+
+                        if (targetIndices.length === 0) {
+                            return { content: "Nothing to compress - context is already efficient" }
+                        }
+
+                        const targetMessages = targetIndices.map((i) => messageWithParts[i])
+                        const summary = buildCompressionSummary(targetMessages, args.focus)
+
+                        const outputTokens = await countTokens(summary)
+                        const ratio = inputTokens > 0 ? 1 - outputTokens / inputTokens : 0
+
+                        addCompressionRecord(
+                            state,
+                            {
+                                timestamp: Date.now(),
+                                inputTokens,
+                                outputTokens,
+                                ratio,
+                                messageCount: targetMessages.length,
+                                success: true,
+                            },
+                            config.adaptive.learningRate,
+                        )
+
+                        saveSessionState(state, config.persistence.directory)
+
+                        return {
+                            content: `## Compressed ${targetMessages.length} messages\n\n${summary}\n\n---\n**Stats:** ${inputTokens} → ${outputTokens} tokens (${Math.round(ratio * 100)}% saved) | Mode: ${mode} | Focus: ${args.focus}`,
+                        }
+                    } catch (error) {
+                        return {
+                            content: `Error compressing: ${error instanceof Error ? error.message : "Unknown error"}`,
+                        }
+                    }
+                },
+            })
+
+            editor.add({
+                name: "panel",
+                description: `Display a rich context usage panel showing:
+- Current token usage vs model limit
+- Message breakdown (user/assistant/tools)
+- Token distribution by role
+- Compression history and savings
+- Cost estimate
+- Topic distribution
+- Smart recommendations`,
+                input: {
+                    type: "object",
+                    properties: {},
+                    additionalProperties: false,
+                },
+                execute: async (_input, context) => {
+                    const sessionId = (context as any).sessionID || ""
+                    const config = getConfig(sessionId)
+                    const state = getState(sessionId, config)
+
+                    try {
+                        const messages = await ctx.session.context({ sessionID: sessionId })
+
+                        if (!messages || messages.length === 0) {
+                            return { content: "No messages found in session" }
+                        }
+
+                        const messageWithParts: MessageWithParts[] = messages.map((m: any) => ({
+                            info: m.info || m,
+                            parts: m.parts || [],
+                        }))
+
+                        const modelId = (context as any).model?.id || "unknown"
+
+                        const panelData = await buildPanelData(
+                            sessionId,
+                            messageWithParts,
+                            state,
+                            config,
+                            modelId,
+                        )
+
+                        const panel = renderPanel(panelData)
+
+                        return { content: panel }
+                    } catch (error) {
+                        return {
+                            content: `Error generating panel: ${error instanceof Error ? error.message : "Unknown error"}`,
+                        }
+                    }
+                },
+            })
+        })
+
+        // ─── System Prompt Hook ──────────────────────────────────────────
+        await ctx.session.hook("context", (event) => {
+            const sessionId = (event as any).sessionID || ""
+            const config = getConfig(sessionId)
+            if (!config.enabled || !config.compress.enabled) {
+                return
+            }
+
+            const state = getState(sessionId, config)
+
+            // Track model context limit
+            if ((event as any).model?.limit?.context) {
+                state.modelContextLimit = (event as any).model.limit.context
+            }
+
+            // Add system prompt
+            const systemPrompt = getSystemPrompt()
+            event.system.push({ type: "text", text: systemPrompt })
+        })
+
+        // ─── Messages Transform Hook ─────────────────────────────────────
+        await ctx.session.hook("context", async (event) => {
+            const config = getConfig("")
+            if (!config.enabled) {
+                return
+            }
+
+            const sessionId = (event as any).sessionID || ""
+            const state = getState(sessionId, config)
+
+            // Apply pruning strategies to messages
+            if (event.messages && Array.isArray(event.messages)) {
+                const prunedMessages = pruneMessages(
+                    event.messages as any,
+                    config,
+                    event.messages.length,
+                )
+
+                // Replace messages
+                event.messages.length = 0
+                event.messages.push(...(prunedMessages as any))
+
+                // Check if compression nudge is needed
+                let totalTokens = 0
+                for (const msg of event.messages) {
+                    const text = getMessageText(msg as any) + getToolResultContent(msg as any)
+                    totalTokens += await countTokens(text)
+                }
+
+                state.currentTokenCount = totalTokens
+
+                const maxTokens = resolveTokenLimit(
+                    config.compress.maxContextLimit,
+                    state.modelContextLimit,
+                )
+                const minTokens = resolveTokenLimit(
+                    config.compress.minContextLimit,
+                    state.modelContextLimit,
+                )
+
+                const shouldComp = shouldCompress(
+                    totalTokens,
+                    maxTokens,
+                    minTokens,
+                    state.lastCompressionTime,
+                    config.compress.nudgeFrequency,
+                    event.messages.length,
+                )
+
+                if (shouldComp.compress && !state.manualMode) {
+                    const nudgeMessage = getNudgeMessage(
+                        shouldComp.reason,
+                        totalTokens,
+                        maxTokens,
+                    )
+                    event.messages.push({
+                        info: {
+                            role: "assistant",
+                            sessionID: sessionId,
+                        } as any,
+                        parts: [{ type: "text", text: nudgeMessage }],
+                    } as any)
+                }
+
+                saveSessionState(state, config.persistence.directory)
+            }
+        })
+
+        // ─── Event Subscription ──────────────────────────────────────────
+        const eventController = new AbortController()
+        void (async () => {
+            for await (const event of ctx.event.subscribe({ signal: eventController.signal })) {
+                if (event.type === "session.created") {
+                    const properties = (event as any).properties || {}
+                    const sessionId = properties.sessionID || ""
+                    const config = getConfig(sessionId)
+                    sessionConfigs.set(sessionId, config)
+                    getState(sessionId, config)
+                }
+            }
+        })()
+
+        // ─── Cleanup ─────────────────────────────────────────────────────
+        return () => {
+            eventController.abort()
+            // Save all states on dispose
+            for (const [sessionId, state] of sessionStates.entries()) {
+                const config = getConfig(sessionId)
+                saveSessionState(state, config.persistence.directory)
+            }
+        }
+    },
+})
