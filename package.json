@@ -1,0 +1,76 @@
+{
+  "name": "@serkanalgur/opencodev2-slim",
+  "version": "1.0.0",
+  "description": "Smart context management plugin for OpenCode v2 - semantic compression, cost-aware pruning, adaptive thresholds",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "context",
+    "compression",
+    "pruning",
+    "tokens",
+    "semantic"
+  ],
+  "homepage": "https://github.com/serkanalgur/opencodev2-slim#readme",
+  "bugs": {
+    "url": "https://github.com/serkanalgur/opencodev2-slim/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/serkanalgur/opencodev2-slim.git"
+  },
+  "license": "MIT",
+  "author": "serkanalgur",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "@anthropic-ai/tokenizer": "^0.0.4",
+    "jsonc-parser": "^3.3.1"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.29",
+    "@opentui/core": "^0.4.5",
+    "@opentui/keymap": "^0.4.5",
+    "@opentui/solid": "^0.4.5",
+    "@types/node": "^22.0.0",
+    "prettier": "^3.4.0",
+    "solid-js": "1.9.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.29",
+    "@opentui/core": ">=0.4.5",
+    "@opentui/keymap": ">=0.4.5",
+    "@opentui/solid": ">=0.4.5",
+    "solid-js": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/keymap": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  }
+}
