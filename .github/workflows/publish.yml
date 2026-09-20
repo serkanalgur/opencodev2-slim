@@ -1,16 +1,17 @@
-name: Publish to npm
+name: Publish Package
 
 on:
   push:
     tags:
       - 'v*'
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -19,8 +20,18 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      - run: npm ci
+      - name: Upgrade npm to latest
+        run: npm install -g npm@latest
 
+      - run: npm ci --legacy-peer-deps
+      - run: npm run build
       - run: npm test
 
-      - run: npm publish --provenance --access public
+      - name: Set version from release tag
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "Setting version to: $VERSION"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Publish package
+        run: npm publish
