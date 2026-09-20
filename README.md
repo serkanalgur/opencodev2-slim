@@ -5,8 +5,6 @@
 
 Smart context management plugin for OpenCode v2. Optimizes token usage through semantic compression, cost-aware pruning, and adaptive thresholds.
 
-> **Note:** This plugin requires OpenCode v2 (1.18.29+). For v1 compatibility, use [@serkanalgur/opencode-slim](https://github.com/serkanalgur/opencode-slim).
-
 ## Features
 
 - **TUI Panel** - Rich context usage visualization with status indicators
@@ -140,6 +138,33 @@ State is saved to disk, so compression history and learning persist across resta
 | `/compress` | Show instructions for using the compress tool |
 
 Note: Compression is performed by the AI assistant using the `compress` tool. The slash command provides guidance on usage.
+
+## Changelog
+
+### 2.0.2
+
+- Update README documentation
+- Add GitHub Actions workflow for automated npm publish
+
+### 2.0.1
+
+- Fix npm publish conflict
+
+### 2.0.0
+
+**Breaking Changes:** Migrated to OpenCode v2 plugin API.
+
+- Migrate from `@opencode-ai/plugin` to `@opencode/plugin`
+- Use `Plugin.define()` pattern instead of server function
+- Register tools via `ctx.tool.transform()` with JSON Schema input
+- Replace experimental hooks with `ctx.session.hook()`
+- Replace event callback with `ctx.event.subscribe()`
+- Update cleanup to use setup return function
+- Minimum OpenCode version: 2.0.0
+
+### 1.0.1
+
+- Initial release
 
 ## License
 
