@@ -308,17 +308,21 @@ export default Plugin.define({
 
             const state = getState(sessionId, config)
 
-            // Apply pruning strategies
-            const pruned = pruneMessages(
-                event.messages.map((m: any) => wrapAsMessageWithParts(m)),
-                config,
-                event.messages.length,
-            )
+            // Apply pruning - work with original OpenCode message format
+            // event.messages contains { role, content: Part[], ... } objects
+            const wrapped = event.messages.map((m: any) => wrapAsMessageWithParts(m))
+            const pruned = pruneMessages(wrapped, config, event.messages.length)
 
-            // Replace messages in-place
-            event.messages.length = 0
-            for (const msg of pruned) {
-                event.messages.push(msg as any)
+            // Build a Set of pruned message IDs to keep
+            const keepIds = new Set(pruned.map((m) => m.info.id))
+
+            // Remove duplicates in-place, preserving OpenCode's message format
+            for (let i = event.messages.length - 1; i >= 0; i--) {
+                const msg = event.messages[i] as any
+                const id = msg.id || msg.info?.id
+                if (id && !keepIds.has(id)) {
+                    event.messages.splice(i, 1)
+                }
             }
 
             // Quick token estimate (sync, ~4 chars per token)
