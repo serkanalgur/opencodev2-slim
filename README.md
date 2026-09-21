@@ -141,6 +141,11 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 2.0.8
+
+- Fix `keymap.provider is missing` in the CLI plugin: register the keymap layer inside
+  an `app` slot render (where the keymap provider is available) instead of in `setup()`.
+
 ### 2.0.7
 
 - Fix `Cannot find package 'react'` when the plugin is loaded from the global npm cache:
