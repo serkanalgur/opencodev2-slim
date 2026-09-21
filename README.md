@@ -141,6 +141,13 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 2.0.13
+
+- Fix `/panel` in the TUI not reflecting real context usage:
+  - The TUI command now reads live server measurements (`Session.Info.tokens` + `cost` + `model` + context window) via `context.client.session.get()` and prints them (measured tokens, %, cost, model) at the bottom of the panel, matching what the `panel` tool reports.
+  - Resolve the active session from `context.ui.router.current()` instead of a non-existent `context.router`, so the panel targets the focused session rather than always the first one.
+  - Call `context.data.session.message.sync()` before reading the transcript so stats aren't computed from an empty/stale cache.
+
 ### 2.0.12
 
 - Bind panel/nudge to real OpenCode context measurements:
