@@ -141,6 +141,13 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 2.0.3
+
+- Fix v2 API compatibility issues
+- Remove namespace from tool registration
+- Handle both v1 and v2 message part types
+- Make context hooks synchronous
+
 ### 2.0.2
 
 - Update README documentation
