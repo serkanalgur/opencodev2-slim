@@ -25,16 +25,18 @@
   "exports": {
     ".": "./src/index.ts"
   },
-  "main": "index.js",
+  "main": "./src/index.ts",
   "directories": {
     "test": "tests"
   },
   "files": [
+    "dist/",
     "src/",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
+    "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.ts",
     "format": "prettier --write .",
