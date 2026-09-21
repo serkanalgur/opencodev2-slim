@@ -141,6 +141,13 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 2.0.12
+
+- Bind panel/nudge to real OpenCode context measurements:
+  - Resolve the active model's real context window from `ctx.model.default().data.limit.context` instead of the hard-coded 200k.
+  - `/panel` now reads live server measurements (`Session.Info.tokens` + `cost`) via `ctx.session.get()` and feeds them to `buildPanelData`, so the headline tokens/percent/cost match what OpenCode's UI reports.
+  - The nudge decision prefers the measured token count over the rough 4-char estimation.
+
 ### 2.0.11
 
 - Fix CI publish: add `solid-js`, `@opentui/core`, `@opentui/solid` to `devDependencies`.
