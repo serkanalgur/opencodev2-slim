@@ -141,6 +141,12 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 2.0.11
+
+- Fix CI publish: add `solid-js`, `@opentui/core`, `@opentui/solid` to `devDependencies`.
+  The workflow runs `npm ci --legacy-peer-deps`, which skips peer deps, so loading
+  `@opencode/plugin/tui` failed with `Cannot find package 'solid-js'`.
+
 ### 2.0.10
 
 - Fix `/panel` output showing `User tokens: 0`: user/system messages carry their text
