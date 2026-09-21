@@ -141,6 +141,14 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 2.0.9
+
+- `feat(panel-as-message)`: `/panel` and `slim-panel` now print the context stats as plain
+  text into the message stream via `client.session.synthetic`, instead of taking over
+  OpenCode's own panel UI (`session.panel` slot + `ui.panel.open` removed).
+- The TUI panel now derives its own stats (token estimate, role breakdown, tool/compaction
+  counts) directly from the session transcript rather than deferring to the server tool.
+
 ### 2.0.8
 
 - Fix `keymap.provider is missing` in the CLI plugin: register the keymap layer inside
