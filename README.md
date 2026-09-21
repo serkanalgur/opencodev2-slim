@@ -141,6 +141,12 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 2.0.10
+
+- Fix `/panel` output showing `User tokens: 0`: user/system messages carry their text
+  on a top-level `text` field (not inside `content`), which `deriveStats` now captures.
+- Add regression tests for CLI panel stats.
+
 ### 2.0.9
 
 - `feat(panel-as-message)`: `/panel` and `slim-panel` now print the context stats as plain
