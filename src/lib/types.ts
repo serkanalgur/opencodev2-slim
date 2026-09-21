@@ -28,6 +28,8 @@ export interface SlimConfig {
         nudgeForce?: "strong" | "soft"
         protectUserMessages: boolean
         protectedTools: string[]
+        /** Number of recent messages to always keep during auto-compress (default: 5) */
+        keepRecent?: number
     }
 
     // Strategy settings

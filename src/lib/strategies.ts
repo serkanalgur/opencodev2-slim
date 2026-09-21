@@ -1,6 +1,7 @@
 import type { MessageWithParts, SlimConfig, SessionState, CompressionBlock } from "./types"
-import { getToolName, getMessageText } from "./compress"
+import { getToolName, getMessageText, getToolResultContent, countTokens } from "./compress"
 import { contextLimitNudge, turnNudge, iterationNudge, NUDGE_MARKERS } from "./prompts"
+import { addCompressionRecord } from "./state"
 
 // ─── DCP-style Compression Blocks ───────────────────────────────────────────
 //
@@ -608,4 +609,128 @@ export function injectLimitNudges(
     )
 
     state.nudges = nudges
+}
+
+// ─── Auto-compress: directly compress when over limit ───────────────────────
+
+/**
+ * Automatically compresses old messages when context exceeds the max limit.
+ * Called from the context hook when overMax is true — no model cooperation needed.
+ * Registers a compression block so future requests use the summary instead.
+ */
+export async function autoCompress(
+    state: SessionState,
+    config: SlimConfig,
+    messages: any[],
+    currentTokens: number,
+    limits: { max: number; min: number },
+): Promise<{ compressed: boolean; messageCount?: number; tokensSaved?: number }> {
+    if (config.compress.permission === "deny") return { compressed: false }
+    if (state.manualMode) return { compressed: false }
+    if (limits.max <= 0) return { compressed: false }
+    if (currentTokens <= limits.max) return { compressed: false }
+
+    // Throttle: don't auto-compress more than once every 5 minutes
+    const now = Date.now()
+    const lastAuto = (state as any).lastAutoCompressTime ?? 0
+    if (now - lastAuto < 5 * 60 * 1000) return { compressed: false }
+
+    // Don't auto-compress if the model just compressed in the last assistant turn
+    const lastAssistant = [...messages].reverse().find((m: any) => m?.role === "assistant")
+    if (lastAssistant && messageHasCompress(lastAssistant)) return { compressed: false }
+
+    const keepRecent = Math.max(2, config.compress.keepRecent ?? 5)
+    const messageWithParts: MessageWithParts[] = messages.map((m: any) => ({
+        info: {
+            id: m?.id ?? m?.info?.id ?? "",
+            role: m?.role ?? m?.info?.role ?? "user",
+            sessionID: m?.sessionID ?? m?.info?.sessionID ?? "",
+            time: { created: Date.now() },
+        } as any,
+        parts: m?.parts ?? m?.content ?? [],
+    }))
+
+    // Select messages to compress: all except recent ones, with >100 tokens
+    const targetIndices: number[] = []
+    let inputTokens = 0
+    for (let i = 0; i < messageWithParts.length - keepRecent; i++) {
+        const msg = messageWithParts[i]
+        const text = getMessageText(msg) + getToolResultContent(msg)
+        const tokens = await countTokens(text)
+        if (tokens < 100) continue
+        targetIndices.push(i)
+        inputTokens += tokens
+    }
+
+    if (targetIndices.length === 0) {
+        ;(state as any).lastAutoCompressTime = now
+        return { compressed: false }
+    }
+
+    // Build summary
+    const targetMessages = targetIndices.map((i) => messageWithParts[i])
+    const summary = await buildCompressionSummary(
+        targetMessages,
+        "auto-compress: context limit exceeded",
+        config.compress.protectedTools,
+        config.compress.protectUserMessages,
+    )
+    const outputTokens = await countTokens(summary)
+
+    // Register compression block
+    const sorted = [...targetIndices].sort((a, b) => a - b)
+    const coveredIndices = new Set(sorted)
+    let anchorIndex = sorted[sorted.length - 1] + 1
+    if (anchorIndex >= messageWithParts.length) {
+        anchorIndex = messageWithParts.length - 1
+        coveredIndices.delete(anchorIndex)
+    }
+    if (anchorIndex < 0 || anchorIndex >= messageWithParts.length) {
+        ;(state as any).lastAutoCompressTime = now
+        return { compressed: false }
+    }
+
+    const anchorId = messageWithParts[anchorIndex].info?.id
+    if (!anchorId) {
+        ;(state as any).lastAutoCompressTime = now
+        return { compressed: false }
+    }
+
+    const coveredIds = [...coveredIndices]
+        .map((i) => messageWithParts[i].info?.id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0)
+    if (coveredIds.length === 0) {
+        ;(state as any).lastAutoCompressTime = now
+        return { compressed: false }
+    }
+
+    registerCompressionBlock(state, {
+        coveredIds,
+        anchorMessageId: anchorId,
+        summary,
+        topic: "auto-compress",
+        summaryTokens: outputTokens,
+    })
+
+    // Record compression stats
+    const ratio = inputTokens > 0 ? 1 - outputTokens / inputTokens : 0
+    addCompressionRecord(
+        state,
+        {
+            timestamp: now,
+            inputTokens,
+            outputTokens,
+            ratio,
+            messageCount: targetMessages.length,
+            success: true,
+        },
+        config.adaptive.learningRate,
+    )
+
+    ;(state as any).lastAutoCompressTime = now
+    return {
+        compressed: true,
+        messageCount: targetMessages.length,
+        tokensSaved: inputTokens - outputTokens,
+    }
 }

@@ -19,6 +19,7 @@ const DEFAULT_CONFIG: SlimConfig = {
         nudgeForce: "soft",
         protectUserMessages: false,
         protectedTools: ["task", "skill", "todowrite", "todoread"],
+        keepRecent: 5,
     },
     strategies: {
         deduplication: {
