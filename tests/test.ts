@@ -168,6 +168,63 @@ describe("TUI Panel", () => {
         assert.ok(panelData.currentTokens > 0)
     })
 
+    it("should assign tool tokens to the tools bucket, not always zero", async () => {
+        const messages: MessageWithParts[] = [
+            {
+                info: { id: "1", role: "user", sessionID: "s1", time: { created: Date.now() } } as any,
+                parts: [{ type: "text", text: "Hello" } as any],
+            },
+            {
+                info: { id: "2", role: "tool", sessionID: "s1", time: { created: Date.now() } } as any,
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "bash",
+                        state: { type: "result", output: "some long command output that takes tokens" },
+                    } as any,
+                ],
+            },
+        ]
+
+        const state: SessionState = {
+            sessionId: "s1",
+            modelContextLimit: 200000,
+            currentTokenCount: 0,
+            compressionCount: 0,
+            lastCompressionTime: 0,
+            manualMode: false,
+            compressPermission: null,
+            compressionHistory: [],
+            averageCompressionRatio: 0,
+            toolCalls: new Map(),
+        }
+
+        const config: SlimConfig = {
+            enabled: true,
+            debug: false,
+            compress: {
+                enabled: true,
+                permission: "allow",
+                maxContextLimit: "80%",
+                minContextLimit: "40%",
+                nudgeFrequency: 5,
+                protectUserMessages: false,
+                protectedTools: [],
+            },
+            strategies: {
+                deduplication: { enabled: true, protectedTools: [] },
+                purgeErrors: { enabled: true, turns: 4, protectedTools: [] },
+            },
+            adaptive: { enabled: true, learningRate: 0.1, minCompressionRatio: 0.3 },
+            costAware: { enabled: true, cacheBoostFactor: 0.5 },
+            persistence: { enabled: true, directory: "/tmp/slim-test" },
+        }
+
+        const panelData = await buildPanelData("s1", messages, state, config, "test-model")
+        assert.ok(panelData.tokensByRole.tools > 0, "tool tokens should be > 0")
+        assert.strictEqual(panelData.toolCalls + panelData.toolResults, 1)
+    })
+
     it("should render panel with all sections", async () => {
         const data = {
             sessionId: "s1",
