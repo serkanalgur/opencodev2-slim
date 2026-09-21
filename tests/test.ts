@@ -257,6 +257,72 @@ describe("TUI Panel", () => {
         assert.ok(panel.includes("50.0%"))
         assert.ok(panel.includes("test-model"))
     })
+
+    it("should prefer server-measured tokens/cost/limit when provided", async () => {
+        const messages: MessageWithParts[] = [
+            {
+                info: { id: "1", role: "user", sessionID: "s1", time: { created: Date.now() } } as any,
+                parts: [{ type: "text", text: "Hello" } as any],
+            },
+        ]
+
+        const state: SessionState = {
+            sessionId: "s1",
+            modelContextLimit: 200000,
+            currentTokenCount: 0,
+            compressionCount: 0,
+            lastCompressionTime: 0,
+            manualMode: false,
+            compressPermission: null,
+            compressionHistory: [],
+            averageCompressionRatio: 0,
+            toolCalls: new Map(),
+        }
+
+        const config: SlimConfig = {
+            enabled: true,
+            debug: false,
+            compress: {
+                enabled: true,
+                permission: "allow",
+                maxContextLimit: "30%",
+                minContextLimit: "10%",
+                nudgeFrequency: 5,
+                protectUserMessages: false,
+                protectedTools: [],
+            },
+            strategies: {
+                deduplication: { enabled: true, protectedTools: [] },
+                purgeErrors: { enabled: true, turns: 4, protectedTools: [] },
+            },
+            adaptive: { enabled: true, learningRate: 0.1, minCompressionRatio: 0.3 },
+            costAware: { enabled: true, cacheBoostFactor: 0.5 },
+            persistence: { enabled: true, directory: "/tmp/slim-test" },
+        }
+
+        // Simulate the server reporting 22% of a 1M-token model, $0.25 spent.
+        const panelData = await buildPanelData(
+            "s1",
+            messages,
+            state,
+            config,
+            "real-model",
+            {
+                tokens: 220326,
+                cost: 0.25,
+                contextLimit: 1000000,
+                model: "real-model",
+            },
+        )
+
+        assert.strictEqual(panelData.currentTokens, 220326)
+        assert.ok(Math.abs(panelData.usagePercent - 22.03) < 1, "~22% used (of real model limit)")
+        assert.strictEqual(panelData.estimatedCost, 0.25)
+        assert.strictEqual(panelData.maxTokens, 300000) // 30% of 1,000,000
+        // real limit drives the maxTokens (30% = 300k), not 200k-based 60k
+        assert.ok(panelData.maxTokens === 300000)
+        assert.ok(panelData.model === "real-model")
+    })
 })
 
 // ─── CLI Panel Stats (tui.tsx) ─────────────────────────────────────────────

@@ -50,17 +50,30 @@ export interface PanelData {
 
 // ─── Panel Builder ─────────────────────────────────────────────────────────
 
+export interface MeasuredContext {
+    /** Real context input tokens for this session (Session.Info.tokens.input). */
+    tokens: number
+    /** Real total spend for this session (Session.Info.cost). */
+    cost: number
+    /** Real model context window (Model.Info.limit.context). */
+    contextLimit: number
+    /** Real model id. */
+    model: string
+}
+
 export async function buildPanelData(
     sessionId: string,
     messages: MessageWithParts[],
     state: SessionState,
     config: SlimConfig,
     modelId?: string,
+    measured?: MeasuredContext,
 ): Promise<PanelData> {
-    const modelContextLimit = state.modelContextLimit || 200000
+    // Prefer the real model context window from the server; fall back to state/default.
+    const modelContextLimit = measured?.contextLimit || state.modelContextLimit || 200000
     const maxTokens = resolveTokenLimit(config.compress.maxContextLimit, modelContextLimit)
     
-    // Count tokens
+    // Count tokens (estimation for role breakdown; real total used for usage %).
     let currentTokens = 0
     const tokensByRole = { user: 0, assistant: 0, tools: 0, system: 0 }
     let userMessages = 0
@@ -102,8 +115,15 @@ export async function buildPanelData(
     tokensByRole.tools = Math.max(tokensByRole.tools, 0)
     tokensByRole.system = Math.max(0, currentTokens - tokensByRole.user - tokensByRole.assistant - tokensByRole.tools)
     
-    // Calculate status
-    const usagePercent = (currentTokens / maxTokens) * 100
+    // Prefer the server-measured real token count for the headline usage figure.
+    // Role buckets remain our estimate for breakdown detail.
+    const effectiveTokens = measured?.tokens ?? currentTokens
+    
+    // Usage % shown to the user is relative to the real model context window
+    // (e.g. 220k / 1M = 22%), matching what OpenCode's own UI displays. The
+    // configured maxTokens (a percentage of that same window) drives nudge/compress.
+    const usageBase = measured?.contextLimit ? modelContextLimit : modelContextLimit
+    const usagePercent = (effectiveTokens / modelContextLimit) * 100
     let status: "healthy" | "warning" | "critical" = "healthy"
     if (usagePercent > 90) status = "critical"
     else if (usagePercent > 70) status = "warning"
@@ -121,9 +141,9 @@ export async function buildPanelData(
         ? state.compressionHistory[state.compressionHistory.length - 1]
         : null
     
-    // Cost estimate
+    // Cost: prefer the server-measured real spend; else estimate from tokens.
     const profile = COST_PROFILES[modelId || "default"] || COST_PROFILES.default
-    const estimatedCost = (currentTokens / 1000) * profile.inputPricePer1k
+    const estimatedCost = measured?.cost ?? (currentTokens / 1000) * profile.inputPricePer1k
     const costSaved = (totalTokensSaved / 1000) * profile.inputPricePer1k
     
     // Topic distribution
@@ -155,7 +175,7 @@ export async function buildPanelData(
     return {
         sessionId,
         timestamp: Date.now(),
-        currentTokens,
+        currentTokens: effectiveTokens,
         maxTokens,
         usagePercent,
         status,
@@ -171,7 +191,7 @@ export async function buildPanelData(
         lastCompression,
         estimatedCost,
         costSaved,
-        model: modelId || "unknown",
+        model: measured?.model || modelId || "unknown",
         topics,
         recommendations,
     }

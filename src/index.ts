@@ -36,20 +36,13 @@ function getConfig(sessionId: string): SlimConfig {
 }
 
 // Resolve the active model's real context limit instead of hard-coding 200k.
+// ctx.model.default() returns { data: ModelInfo | null }, where ModelInfo.limit.context
+// holds the model's context window. Use it directly and only fall back when missing.
 async function resolveModelContextLimit(ctx: any): Promise<number> {
     try {
-        const models: any[] = await ctx.model.list()
-        const selected: { providerID?: string; modelID?: string } | undefined =
+        const selected: { data?: { limit?: { context?: number } } | null } | undefined =
             await ctx.model.default()
-        const match =
-            models.find(
-                (m) =>
-                    (selected?.modelID && m.id === selected.modelID) ||
-                    (selected?.providerID && m.providerID === selected.providerID),
-            ) ||
-            models.find((m) => m.limit?.context) ||
-            undefined
-        const limit = match?.limit?.context
+        const limit = selected?.data?.limit?.context
         return typeof limit === "number" && limit > 0 ? limit : DEFAULT_MODEL_LIMIT
     } catch {
         return DEFAULT_MODEL_LIMIT
@@ -300,6 +293,31 @@ export default Plugin.define({
                     const state = getState(sessionId, config)
 
                     try {
+                        // Pull the real, server-measured context usage for this session.
+                        let measured: import("./lib/tui").MeasuredContext | undefined
+                        try {
+                            const info = await ctx.session.get({ sessionID: sessionId })
+                            const tokens = info.tokens as any
+                            const tokenCount =
+                                (tokens?.input ?? 0) +
+                                (tokens?.output ?? 0) +
+                                (tokens?.reasoning ?? 0) +
+                                (tokens?.cache?.read ?? 0) +
+                                (tokens?.cache?.write ?? 0)
+                            measured = {
+                                tokens: tokenCount,
+                                cost: typeof info.cost === "number" ? info.cost : 0,
+                                contextLimit:
+                                    state.modelContextLimit || (await resolveModelContextLimit(ctx)),
+                                model: (info.model && (info.model as any).id) || "unknown",
+                            }
+                            // Keep state's headline figure aligned with reality.
+                            state.modelContextLimit = measured.contextLimit
+                            state.currentTokenCount = measured.tokens
+                        } catch {
+                            // Fall through to estimation if session.get fails.
+                        }
+
                         const messages = await ctx.session.context({ sessionID: sessionId })
 
                         if (!messages || messages.length === 0) {
@@ -315,9 +333,12 @@ export default Plugin.define({
                             messageWithParts,
                             state,
                             config,
+                            measured?.model,
+                            measured,
                         )
 
                         const panel = renderPanel(panelData)
+                        saveSessionState(state, config.persistence.directory)
                         return { content: panel }
                     } catch (error) {
                         return {
@@ -367,19 +388,24 @@ export default Plugin.define({
                 }
             }
 
-            // Quick token estimate (sync, ~4 chars per token)
-            let totalTokens = 0
+            // Quick token estimate (sync, ~4 chars per token). On the first pass
+            // (before the panel has written real numbers into state) this is a
+            // fallback; afterwards we prefer the server-measured value.
+            let estimatedTokens = 0
             for (const msg of event.messages) {
                 const content = (msg as any).content
                 if (Array.isArray(content)) {
                     for (const part of content) {
                         if (part.type === "text" && part.text) {
-                            totalTokens += Math.ceil(part.text.length / 4)
+                            estimatedTokens += Math.ceil(part.text.length / 4)
                         }
                     }
                 }
             }
 
+            // Prefer the real measured token count when available; else the estimate.
+            const totalTokens =
+                state.currentTokenCount > 0 ? state.currentTokenCount : estimatedTokens
             state.currentTokenCount = totalTokens
 
             const maxTokens = resolveTokenLimit(
