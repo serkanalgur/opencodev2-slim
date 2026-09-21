@@ -31,7 +31,7 @@ function emptyStats(): PanelStats {
 }
 
 // Derives context-usage stats from the session transcript.
-function deriveStats(messages: readonly unknown[]): PanelStats {
+export function deriveStats(messages: readonly unknown[]): PanelStats {
     const stats = emptyStats()
     for (const raw of messages) {
         const m = raw as {
@@ -53,6 +53,12 @@ function deriveStats(messages: readonly unknown[]): PanelStats {
             role = "system"
             stats.compactionCount++
             text = m.summary || ""
+        }
+
+        // User/system messages carry their text on a top-level `text` field
+        // (not inside a `content` array). Capture it too so their tokens count.
+        if (role !== "assistant" && typeof (m as any).text === "string") {
+            text += (m as any).text
         }
 
         if (Array.isArray(m.content)) {

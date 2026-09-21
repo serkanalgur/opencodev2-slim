@@ -3,6 +3,7 @@ import assert from "node:assert"
 import { countTokens, shouldCompress, getMessageText, getToolResultContent } from "../src/lib/compress"
 import { pruneMessages } from "../src/lib/strategies"
 import { buildPanelData, renderPanel } from "../src/lib/tui"
+import { deriveStats } from "../src/tui"
 import type { MessageWithParts, SessionState, SlimConfig } from "../src/lib/types"
 
 // ─── Token Counting ─────────────────────────────────────────────────────────
@@ -255,5 +256,43 @@ describe("TUI Panel", () => {
         assert.ok(panel.includes("SLIM CONTEXT PANEL"))
         assert.ok(panel.includes("50.0%"))
         assert.ok(panel.includes("test-model"))
+    })
+})
+
+// ─── CLI Panel Stats (tui.tsx) ─────────────────────────────────────────────
+
+describe("CLI Panel Stats", () => {
+    it("should count user text carried on the top-level text field", () => {
+        const stats = deriveStats([
+            {
+                type: "user",
+                text: "Hello there, please help me with my project",
+            },
+            {
+                type: "assistant",
+                content: [{ type: "text", text: "Sure, I can help with that." }],
+            },
+        ])
+        assert.strictEqual(stats.userMessages, 1)
+        assert.strictEqual(stats.assistantMessages, 1)
+        assert.ok(stats.tokensByRole.user > 0, "user tokens should be > 0")
+        assert.strictEqual(stats.totalMessages, 2)
+    })
+
+    it("should count tool calls inside assistant content", () => {
+        const stats = deriveStats([
+            {
+                type: "user",
+                text: "run it",
+            },
+            {
+                type: "assistant",
+                content: [
+                    { type: "text", text: "Let me run that." },
+                    { type: "tool", text: '{"command":"ls"}' },
+                ],
+            },
+        ])
+        assert.strictEqual(stats.toolCalls, 1)
     })
 })
