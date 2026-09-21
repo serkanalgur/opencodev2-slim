@@ -141,6 +141,13 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 2.0.7
+
+- Fix `Cannot find package 'react'` when the plugin is loaded from the global npm cache:
+  add a per-file `/** @jsxImportSource @opentui/solid */` pragma to `src/tui.tsx` so JSX
+  always compiles against `@opentui/solid/jsx-runtime`
+- Ship `tsconfig.json` in the published package so loaders that read `jsxImportSource` from config pick it up
+
 ### 2.0.6
 
 - Add real `compaction` hook so history actually shrinks (the `context` hook only affects the outgoing request)
