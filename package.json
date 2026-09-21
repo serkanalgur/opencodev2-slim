@@ -1,6 +1,6 @@
 {
   "name": "@serkanalgur/opencodev2-slim",
-  "version": "2.0.5",
+  "version": "2.0.6",
   "description": "Smart context management plugin for OpenCode v2 - semantic compression, cost-aware pruning, adaptive thresholds",
   "keywords": [
     "opencode",
@@ -23,7 +23,8 @@
   "author": "serkanalgur",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
   },
   "main": "./src/index.ts",
   "directories": {
@@ -60,6 +61,9 @@
     }
   },
   "peerDependencies": {
-    "@opencode/plugin": ">=2.0.0"
+    "@opencode/plugin": ">=2.0.0",
+    "@opentui/core": ">=0.5.8",
+    "@opentui/solid": ">=0.5.8",
+    "solid-js": ">=1.9.0"
   }
 }

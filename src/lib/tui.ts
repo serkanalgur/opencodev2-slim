@@ -81,6 +81,8 @@ export async function buildPanelData(
         } else if (role === "assistant") {
             tokensByRole.assistant += msgTokens
             assistantMessages++
+        } else if (role === "tool") {
+            tokensByRole.tools += msgTokens
         }
         
         // Count tool parts
@@ -96,7 +98,8 @@ export async function buildPanelData(
         }
     }
     
-    tokensByRole.tools = tokensByRole.user + tokensByRole.assistant - tokensByRole.user - tokensByRole.assistant
+    // Tools token bucket: captured separately above; keep it consistent.
+    tokensByRole.tools = Math.max(tokensByRole.tools, 0)
     tokensByRole.system = Math.max(0, currentTokens - tokensByRole.user - tokensByRole.assistant - tokensByRole.tools)
     
     // Calculate status

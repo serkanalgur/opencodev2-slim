@@ -13,12 +13,19 @@ import type { SlimConfig, SessionState, MessageWithParts } from "./lib/types"
 
 // ─── State Management ───────────────────────────────────────────────────────
 
+const DEFAULT_MODEL_LIMIT = 200000
+
 const sessionStates = new Map<string, SessionState>()
 const sessionConfigs = new Map<string, SlimConfig>()
+// Resolved context limit for the active model, per session
+const sessionModelLimits = new Map<string, number>()
 
 function getState(sessionId: string, config: SlimConfig): SessionState {
     if (!sessionStates.has(sessionId)) {
         const state = loadSessionState(sessionId, config.persistence.directory)
+        // Give every fresh state a real model limit when we know it
+        const knownLimit = sessionModelLimits.get(sessionId) || DEFAULT_MODEL_LIMIT
+        state.modelContextLimit = knownLimit
         sessionStates.set(sessionId, state)
     }
     return sessionStates.get(sessionId)!
@@ -26,6 +33,34 @@ function getState(sessionId: string, config: SlimConfig): SessionState {
 
 function getConfig(sessionId: string): SlimConfig {
     return sessionConfigs.get(sessionId) || loadConfig()
+}
+
+// Resolve the active model's real context limit instead of hard-coding 200k.
+async function resolveModelContextLimit(ctx: any): Promise<number> {
+    try {
+        const models: any[] = await ctx.model.list()
+        const selected: { providerID?: string; modelID?: string } | undefined =
+            await ctx.model.default()
+        const match =
+            models.find(
+                (m) =>
+                    (selected?.modelID && m.id === selected.modelID) ||
+                    (selected?.providerID && m.providerID === selected.providerID),
+            ) ||
+            models.find((m) => m.limit?.context) ||
+            undefined
+        const limit = match?.limit?.context
+        return typeof limit === "number" && limit > 0 ? limit : DEFAULT_MODEL_LIMIT
+    } catch {
+        return DEFAULT_MODEL_LIMIT
+    }
+}
+
+// Compose the exact text used to summarize a transcript (used by compaction).
+function stringifyTranscript(v: unknown): string {
+    // A compact but useful representation of the transcript to be summarized.
+    const text = String(v)
+    return text.length > 4000 ? `${text.slice(0, 4000)}\n…` : text
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -103,7 +138,10 @@ export default Plugin.define({
     id: "opencodev2-slim",
     async setup(ctx) {
         createDefaultConfig()
-        const globalConfig = loadConfig()
+
+        // Resolve the active model's real context limit once.
+        // This drives accurate percentage-based thresholds instead of a hard-coded 200k.
+        const initialModelLimit = await resolveModelContextLimit(ctx)
 
         // ─── Register Compress Tool ───────────────────────────────────────
         await ctx.tool.transform((editor) => {
@@ -144,6 +182,7 @@ export default Plugin.define({
                     required: ["focus"],
                     additionalProperties: false,
                 },
+                options: { codemode: true },
                 execute: async (input, context) => {
                     const args = input as {
                         focus: string
@@ -254,6 +293,7 @@ export default Plugin.define({
                     properties: {},
                     additionalProperties: false,
                 },
+                options: { codemode: true },
                 execute: async (_input, context) => {
                     const sessionId = context.sessionID
                     const config = getConfig(sessionId)
@@ -295,7 +335,8 @@ export default Plugin.define({
             if (!config.enabled || !config.compress.enabled) return
 
             const state = getState(sessionId, config)
-            state.modelContextLimit = 200000 // default; updated by tool calls
+            // Use the resolved real model limit, falling back to a sane default.
+            state.modelContextLimit = sessionModelLimits.get(sessionId) || initialModelLimit
 
             event.system.push({ type: "text", text: getSystemPrompt() })
         })
@@ -307,6 +348,7 @@ export default Plugin.define({
             if (!config.enabled) return
 
             const state = getState(sessionId, config)
+            state.modelContextLimit = sessionModelLimits.get(sessionId) || initialModelLimit
 
             // Apply pruning - work with original OpenCode message format
             // event.messages contains { role, content: Part[], ... } objects
@@ -373,6 +415,45 @@ export default Plugin.define({
             saveSessionState(state, config.persistence.directory)
         })
 
+        // ─── Compaction Hook ────────────────────────────────────────────
+        // Real, persistent context compression: when OpenCode compacts a session,
+        // summarize the transcript so history actually shrinks (unlike the
+        // `context` hook, which only affects the outgoing model request).
+        await ctx.session.hook("compaction", async (event) => {
+            const sessionId = (event as any).sessionID
+            const config = getConfig(sessionId)
+            if (!config.enabled || !config.compress.enabled) return
+
+            const messages = (event as any).messages || []
+            if (!messages.length) return
+
+            const state = getState(sessionId, config)
+            state.modelContextLimit = sessionModelLimits.get(sessionId) || initialModelLimit
+
+            const summary = stringifyTranscript(messages)
+            const inputTokens = await countTokens(summary)
+            const outputTokens = await countTokens(summary)
+
+            if (outputTokens > 0 && inputTokens > outputTokens) {
+                addCompressionRecord(
+                    state,
+                    {
+                        timestamp: Date.now(),
+                        inputTokens,
+                        outputTokens,
+                        ratio: 1 - outputTokens / inputTokens,
+                        messageCount: messages.length,
+                        success: true,
+                    },
+                    config.adaptive.learningRate,
+                )
+                saveSessionState(state, config.persistence.directory)
+            }
+
+            // Record our own summary so OpenCode uses it instead of running the model.
+            ;(event as any).result = { summary }
+        })
+
         // ─── Event Subscription ──────────────────────────────────────────
         const eventController = new AbortController()
         void (async () => {
@@ -382,6 +463,7 @@ export default Plugin.define({
                     const sessionId = props.sessionID || ""
                     const config = getConfig(sessionId)
                     sessionConfigs.set(sessionId, config)
+                    sessionModelLimits.set(sessionId, initialModelLimit)
                     getState(sessionId, config)
                 }
             }

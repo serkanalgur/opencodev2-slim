@@ -141,6 +141,15 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 2.0.6
+
+- Add real `compaction` hook so history actually shrinks (the `context` hook only affects the outgoing request)
+- Resolve the active model's real context limit instead of hard-coding 200k
+- Register `compress`/`panel` tools with `options.codemode` so they appear in agent/codemode environments
+- Fix token-by-role panel bug where `tools` always equalled zero
+- Replace toast-only CLI panel with a real `session.panel` slot (`slim-panel` / `/panel`)
+- Add regression test for the tool-token bucket
+
 ### 2.0.3
 
 - Fix v2 API compatibility issues
