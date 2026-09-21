@@ -13,6 +13,29 @@ const DEFAULT_STATE: SessionState = {
     compressionHistory: [],
     averageCompressionRatio: 0,
     toolCalls: new Map(),
+    compressionBlocks: [],
+    nextBlockId: 1,
+    nudges: { contextLimitAnchors: [], turnNudgeAnchors: [], iterationNudgeAnchors: [] },
+}
+
+export function normalizeState(state: SessionState): SessionState {
+    state.compressionBlocks = Array.isArray(state.compressionBlocks) ? state.compressionBlocks : []
+    state.nextBlockId =
+        typeof state.nextBlockId === "number" && state.nextBlockId > 0
+            ? state.nextBlockId
+            : state.compressionBlocks.reduce((max, b) => Math.max(max, b.blockId), 0) + 1
+    state.nudges = {
+        contextLimitAnchors: Array.isArray(state.nudges?.contextLimitAnchors)
+            ? state.nudges.contextLimitAnchors
+            : [],
+        turnNudgeAnchors: Array.isArray(state.nudges?.turnNudgeAnchors)
+            ? state.nudges.turnNudgeAnchors
+            : [],
+        iterationNudgeAnchors: Array.isArray(state.nudges?.iterationNudgeAnchors)
+            ? state.nudges.iterationNudgeAnchors
+            : [],
+    }
+    return state
 }
 
 export function loadSessionState(sessionId: string, persistenceDir: string): SessionState {
@@ -26,13 +49,13 @@ export function loadSessionState(sessionId: string, persistenceDir: string): Ses
             if (parsed.toolCalls && Array.isArray(parsed.toolCalls)) {
                 parsed.toolCalls = new Map(parsed.toolCalls)
             }
-            return { ...DEFAULT_STATE, ...parsed, sessionId }
+            return normalizeState({ ...DEFAULT_STATE, ...parsed, sessionId })
         } catch {
             // Use default
         }
     }
 
-    return { ...DEFAULT_STATE, sessionId }
+    return normalizeState({ ...DEFAULT_STATE, sessionId })
 }
 
 export function saveSessionState(state: SessionState, persistenceDir: string): void {

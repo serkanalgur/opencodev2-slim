@@ -1,15 +1,25 @@
 import { Plugin } from "@opencode/plugin"
-import { loadConfig, createDefaultConfig, resolveTokenLimit } from "./lib/config"
 import {
-    loadSessionState,
-    saveSessionState,
-    addCompressionRecord,
-} from "./lib/state"
-import { countTokens, shouldCompress, getMessageText, getToolResultContent } from "./lib/compress"
-import { pruneMessages } from "./lib/strategies"
-import { getSystemPrompt, getCompressToolDescription, getNudgeMessage } from "./lib/prompts"
+    loadConfig,
+    createDefaultConfig,
+    resolveTokenLimit,
+    resolveCompressLimits,
+} from "./lib/config"
+import { loadSessionState, saveSessionState, addCompressionRecord } from "./lib/state"
+import { countTokens, getMessageText, getToolResultContent } from "./lib/compress"
+import {
+    syncCompressionBlocks,
+    applyCompressedRanges,
+    registerCompressionBlock,
+    buildCompressionSummary,
+    purgeStaleToolErrors,
+    pruneInPlace,
+    injectLimitNudges,
+    findLastUserMessage,
+} from "./lib/strategies"
+import { getSystemPrompt, getCompressToolDescription } from "./lib/prompts"
 import { buildPanelData, renderPanel } from "./lib/tui"
-import type { SlimConfig, SessionState, MessageWithParts } from "./lib/types"
+import type { SlimConfig, SessionState, MessageWithParts, CompressionBlock } from "./lib/types"
 
 // ─── State Management ───────────────────────────────────────────────────────
 
@@ -58,70 +68,59 @@ function stringifyTranscript(v: unknown): string {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function buildCompressionSummary(messages: MessageWithParts[], focus: string): string {
-    const lines: string[] = []
-    lines.push(`## Compression Summary`)
-    lines.push(`Focus: ${focus}`)
-    lines.push(`Messages compressed: ${messages.length}`)
-    lines.push("")
+// Register a DCP-style compression block for the selected range. The range is
+// covered (removed from future outgoing requests) and the summary is injected
+// at the anchor: the first message after the range, or the latest message when
+// the range reaches the end (the active user turn is never replaced).
+function registerBlockForRange(
+    state: SessionState,
+    topic: string,
+    messageWithParts: MessageWithParts[],
+    targetIndices: number[],
+    summary: string,
+    summaryTokens: number,
+): CompressionBlock | null {
+    if (targetIndices.length === 0 || messageWithParts.length === 0) return null
 
-    const toolCalls: string[] = []
-    const errors: string[] = []
-    const decisions: string[] = []
+    const sorted = [...targetIndices].sort((a, b) => a - b)
+    const coveredIndices = new Set(sorted)
 
-    for (const msg of messages) {
-        for (const part of msg.parts) {
-            if (part.type === "tool-call") {
-                const toolPart = part as any
-                toolCalls.push(
-                    `${toolPart.name}: ${JSON.stringify(toolPart.input || {}).slice(0, 100)}`,
-                )
-            }
-            if (part.type === "tool-result") {
-                const toolPart = part as any
-                if (toolPart.result?.type === "error") {
-                    errors.push(String(toolPart.result.value).slice(0, 200) || "Unknown error")
-                }
-            }
-            if (part.type === "text") {
-                const textPart = part as any
-                const text = textPart.text || ""
-                if (
-                    text.includes("decided") ||
-                    text.includes("chose") ||
-                    text.includes("implemented")
-                ) {
-                    decisions.push(text.slice(0, 200))
-                }
-            }
-        }
+    let anchorIndex = sorted[sorted.length - 1] + 1
+    if (anchorIndex >= messageWithParts.length) {
+        anchorIndex = messageWithParts.length - 1
+        coveredIndices.delete(anchorIndex)
     }
+    if (anchorIndex < 0 || anchorIndex >= messageWithParts.length) return null
 
-    if (toolCalls.length > 0) {
-        lines.push("### Tool Calls")
-        toolCalls.slice(0, 10).forEach((tc) => lines.push(`- ${tc}`))
-        lines.push("")
-    }
+    const anchorId = messageWithParts[anchorIndex].info?.id
+    if (!anchorId) return null
 
-    if (errors.length > 0) {
-        lines.push("### Errors Encountered")
-        errors.slice(0, 5).forEach((e) => lines.push(`- ${e}`))
-        lines.push("")
-    }
+    const coveredIds = [...coveredIndices]
+        .map((i) => messageWithParts[i].info?.id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0)
+    if (coveredIds.length === 0) return null
 
-    if (decisions.length > 0) {
-        lines.push("### Key Decisions")
-        decisions.slice(0, 5).forEach((d) => lines.push(`- ${d}`))
-        lines.push("")
-    }
-
-    return lines.join("\n")
+    return registerCompressionBlock(state, {
+        coveredIds,
+        anchorMessageId: anchorId,
+        summary,
+        topic,
+        summaryTokens,
+    })
 }
 
 function wrapAsMessageWithParts(msg: any): MessageWithParts {
+    const msgInfo = msg.info
+    const id = (msg && (msg.id || msgInfo?.id)) || ""
+    const role = (msg && (msg.role || msgInfo?.role)) || "user"
     return {
-        info: msg.info || { id: msg.id || "", role: msg.role, sessionID: "", time: { created: Date.now() } },
-        parts: msg.parts || msg.content || [],
+        info: {
+            id,
+            role,
+            sessionID: (msg && (msg.sessionID || msgInfo?.sessionID)) || "",
+            time: { created: Date.now() },
+        } as any,
+        parts: (msg && (msg.parts || msg.content)) || [],
     }
 }
 
@@ -241,9 +240,33 @@ export default Plugin.define({
                         }
 
                         const targetMessages = targetIndices.map((i) => messageWithParts[i])
-                        const summary = buildCompressionSummary(targetMessages, args.focus)
+                        const summary = await buildCompressionSummary(
+                            targetMessages,
+                            args.focus,
+                            config.compress.protectedTools,
+                            config.compress.protectUserMessages,
+                        )
                         const outputTokens = await countTokens(summary)
                         const ratio = inputTokens > 0 ? 1 - outputTokens / inputTokens : 0
+
+                        // DCP: register a compression block so future outgoing
+                        // requests replace this range with the summary.
+                        let blockNote = ""
+                        try {
+                            const block = registerBlockForRange(
+                                state,
+                                args.focus,
+                                messageWithParts,
+                                targetIndices,
+                                summary,
+                                outputTokens,
+                            )
+                            if (block) {
+                                blockNote = `\n\n_Block #${block.blockId}: ${block.coveredMessageIds.length} messages will collapse into this summary on future requests (${Math.round((1 - outputTokens / Math.max(1, inputTokens)) * 100)}% smaller)._\n_To restore them: ask to reset context._`
+                            }
+                        } catch {
+                            // Best-effort: the summary is still returned to the model.
+                        }
 
                         addCompressionRecord(
                             state,
@@ -261,7 +284,7 @@ export default Plugin.define({
                         saveSessionState(state, config.persistence.directory)
 
                         return {
-                            content: `## Compressed ${targetMessages.length} messages\n\n${summary}\n\n---\n**Stats:** ${inputTokens} → ${outputTokens} tokens (${Math.round(ratio * 100)}% saved) | Mode: ${mode} | Focus: ${args.focus}`,
+                            content: `## Compressed ${targetMessages.length} messages\n\n${summary}\n\n---\n**Stats:** ${inputTokens} → ${outputTokens} tokens (${Math.round(ratio * 100)}% saved) | Mode: ${mode} | Focus: ${args.focus}${blockNote}`,
                         }
                     } catch (error) {
                         return {
@@ -363,6 +386,10 @@ export default Plugin.define({
         })
 
         // ─── Messages Transform Hook (sync) ──────────────────────────────
+        // DCP pipeline for every outgoing request: sync compression blocks,
+        // replace covered ranges with summary placeholders, prune (dedup +
+        // purge errored tool inputs), then apply DCP limit rules as anchored
+        // nudges. Session history is never modified — only this request.
         await ctx.session.hook("context", (event) => {
             const sessionId = event.sessionID
             const config = getConfig(sessionId)
@@ -371,72 +398,49 @@ export default Plugin.define({
             const state = getState(sessionId, config)
             state.modelContextLimit = sessionModelLimits.get(sessionId) || initialModelLimit
 
-            // Apply pruning - work with original OpenCode message format
-            // event.messages contains { role, content: Part[], ... } objects
-            const wrapped = event.messages.map((m: any) => wrapAsMessageWithParts(m))
-            const pruned = pruneMessages(wrapped, config, event.messages.length)
+            // 1) Compression blocks: activate/deactivate and replace ranges.
+            const presentIds = new Set<string>()
+            for (const msg of event.messages) {
+                const id = (msg as any)?.id ?? (msg as any)?.info?.id
+                if (typeof id === "string") presentIds.add(id)
+            }
+            syncCompressionBlocks(state, presentIds)
+            const filtered = applyCompressedRanges(state, event.messages)
+            event.messages.splice(0, event.messages.length, ...filtered)
 
-            // Build a Set of pruned message IDs to keep
-            const keepIds = new Set(pruned.map((m) => m.info.id))
-
-            // Remove duplicates in-place, preserving OpenCode's message format
-            for (let i = event.messages.length - 1; i >= 0; i--) {
-                const msg = event.messages[i] as any
-                const id = msg.id || msg.info?.id
-                if (id && !keepIds.has(id)) {
-                    event.messages.splice(i, 1)
-                }
+            // 2) Pruning strategies (each request).
+            pruneInPlace(event.messages, config)
+            if (config.strategies.purgeErrors.enabled) {
+                purgeStaleToolErrors(event.messages, config.strategies.purgeErrors.turns)
             }
 
-            // Quick token estimate (sync, ~4 chars per token). On the first pass
-            // (before the panel has written real numbers into state) this is a
-            // fallback; afterwards we prefer the server-measured value.
+            // 3) Token accounting: prefer the server-measured count; fall back
+            //    to a quick estimate (~4 chars per token).
             let estimatedTokens = 0
             for (const msg of event.messages) {
-                const content = (msg as any).content
+                const content = (msg as any)?.content ?? (msg as any)?.parts
                 if (Array.isArray(content)) {
                     for (const part of content) {
-                        if (part.type === "text" && part.text) {
+                        if (part?.type === "text" && part.text) {
                             estimatedTokens += Math.ceil(part.text.length / 4)
                         }
                     }
                 }
             }
-
-            // Prefer the real measured token count when available; else the estimate.
             const totalTokens =
                 state.currentTokenCount > 0 ? state.currentTokenCount : estimatedTokens
             state.currentTokenCount = totalTokens
 
-            const maxTokens = resolveTokenLimit(
-                config.compress.maxContextLimit,
-                state.modelContextLimit,
-            )
-            const minTokens = resolveTokenLimit(
-                config.compress.minContextLimit,
-                state.modelContextLimit,
-            )
-
-            const shouldComp = shouldCompress(
-                totalTokens,
-                maxTokens,
-                minTokens,
-                state.lastCompressionTime,
-                config.compress.nudgeFrequency,
-                event.messages.length,
-            )
-
-            if (shouldComp.compress && !state.manualMode) {
-                const nudgeMessage = getNudgeMessage(
-                    shouldComp.reason,
-                    totalTokens,
-                    maxTokens,
-                )
-                event.messages.push({
-                    role: "assistant",
-                    content: [{ type: "text", text: nudgeMessage }],
-                } as any)
-            }
+            // 4) DCP limit rules → anchored nudges (max 100k / min 50k by
+            //    default, model overrides supported via modelMax/MinLimits).
+            const lastUser = findLastUserMessage(event.messages)
+            const providerId =
+                lastUser?.model?.providerID ?? lastUser?.model?.id?.split?.("/")[0]
+            const modelId =
+                lastUser?.model?.modelID ??
+                lastUser?.model?.id?.split?.("/").slice(1).join("/")
+            const limits = resolveCompressLimits(config, state, providerId, modelId)
+            injectLimitNudges(state, config, event.messages, totalTokens, limits)
 
             saveSessionState(state, config.persistence.directory)
         })

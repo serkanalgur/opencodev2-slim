@@ -6,13 +6,26 @@ export interface SlimConfig {
     enabled: boolean
     debug: boolean
 
-    // Compression settings
+    // Compression settings (DCP-compatible semantics)
     compress: {
         enabled: boolean
+        /** DCP mode: "range" (contiguous spans) or "message" (surgical, single messages) */
+        mode?: "range" | "message"
         permission: "allow" | "ask" | "deny"
-        maxContextLimit: number | string // number or "80%"
-        minContextLimit: number | string // number or "40%"
+        /** Absolute token count or percent string like "80%" (DCP default: 100000) */
+        maxContextLimit: number | string
+        /** Absolute token count or percent string like "40%" (DCP default: 50000) */
+        minContextLimit: number | string
+        /** Per-model overrides, keyed "providerId/modelId" (DCP: compress.modelMaxLimits) */
+        modelMaxLimits?: Record<string, number | string>
+        /** Per-model overrides, keyed "providerId/modelId" (DCP: compress.modelMinLimits) */
+        modelMinLimits?: Record<string, number | string>
+        /** At most one limit-nudge per this many messages (DCP default: 5) */
         nudgeFrequency: number
+        /** Messages since last user message before iteration nudge fires (DCP default: 15) */
+        iterationNudgeThreshold?: number
+        /** Where the turn nudge is anchored: "strong" -> user, "soft" -> assistant (DCP default: soft) */
+        nudgeForce?: "strong" | "soft"
         protectUserMessages: boolean
         protectedTools: string[]
     }
@@ -67,6 +80,40 @@ export interface SessionState {
 
     // Tool call tracking
     toolCalls: Map<string, ToolCallInfo>
+
+    // DCP-style compression blocks (range -> summary placeholders)
+    compressionBlocks?: CompressionBlock[]
+    nextBlockId?: number
+    // DCP-style nudge anchors
+    nudges?: NudgeState
+}
+
+/**
+ * A DCP-style compression block. When active, the covered messages are
+ * removed from every outgoing request and replaced by a synthetic summary
+ * message injected at the anchor message (the message right after the range).
+ */
+export interface CompressionBlock {
+    blockId: number
+    topic: string
+    summary: string
+    /** Message id where the summary is injected (first message after the range, or the last message when the range reaches the end). */
+    anchorMessageId: string
+    /** The assistant message that executed the compress call; used to deactivate blocks when the source is gone. */
+    compressMessageId: string
+    /** Original message ids covered (excluded) by this block. */
+    coveredMessageIds: string[]
+    /** Older blocks swallowed by this block (nested compression). */
+    consumedBlockIds: number[]
+    active: boolean
+    createdAt: number
+    summaryTokens: number
+}
+
+export interface NudgeState {
+    contextLimitAnchors: string[]
+    turnNudgeAnchors: string[]
+    iterationNudgeAnchors: string[]
 }
 
 export interface CompressionRecord {

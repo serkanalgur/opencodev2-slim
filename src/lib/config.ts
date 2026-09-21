@@ -2,17 +2,21 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
 import { parse } from "jsonc-parser/lib/esm/main.js"
-import type { SlimConfig } from "./types"
+import type { SlimConfig, SessionState } from "./types"
 
 const DEFAULT_CONFIG: SlimConfig = {
     enabled: true,
     debug: false,
     compress: {
         enabled: true,
+        mode: "range",
         permission: "allow",
-        maxContextLimit: "80%",
-        minContextLimit: "40%",
+        // DCP defaults: absolute token counts (not percentages).
+        maxContextLimit: 100000,
+        minContextLimit: 50000,
         nudgeFrequency: 5,
+        iterationNudgeThreshold: 15,
+        nudgeForce: "soft",
         protectUserMessages: false,
         protectedTools: ["task", "skill", "todowrite", "todoread"],
     },
@@ -46,7 +50,12 @@ function deepMerge(base: SlimConfig, override: Partial<SlimConfig>): SlimConfig 
     return {
         ...base,
         ...override,
-        compress: { ...base.compress, ...override.compress },
+        compress: {
+            ...base.compress,
+            ...override.compress,
+            modelMaxLimits: override.compress?.modelMaxLimits ?? base.compress.modelMaxLimits,
+            modelMinLimits: override.compress?.modelMinLimits ?? base.compress.modelMinLimits,
+        },
         strategies: {
             deduplication: { ...base.strategies.deduplication, ...override.strategies?.deduplication },
             purgeErrors: { ...base.strategies.purgeErrors, ...override.strategies?.purgeErrors },
@@ -101,14 +110,17 @@ export function createDefaultConfig(): void {
             writeFileSync(
                 configPath,
                 `{
-    // Slim Configuration
+    // Slim Configuration (DCP-compatible limit rules)
     "enabled": true,
     "compress": {
         "enabled": true,
+        "mode": "range",
         "permission": "allow",
-        "maxContextLimit": "80%",
-        "minContextLimit": "40%",
-        "nudgeFrequency": 5
+        "maxContextLimit": 100000,
+        "minContextLimit": 50000,
+        "nudgeFrequency": 5,
+        "iterationNudgeThreshold": 15,
+        "nudgeForce": "soft"
     }
 }`,
                 "utf-8",
@@ -123,4 +135,40 @@ export function resolveTokenLimit(value: number | string, contextLimit: number):
     if (typeof value === "number") return value
     const percent = parseFloat(value.replace("%", "")) / 100
     return Math.floor(contextLimit * percent)
+}
+
+/**
+ * DCP limit resolution. Prefers per-model overrides (compress.modelMinLimits /
+ * compress.modelMaxLimits keyed by "providerId/modelId"), then falls back to the
+ * global max/min limit. Percent strings resolve against the model's context window.
+ */
+export function resolveCompressLimits(
+    config: SlimConfig,
+    state: SessionState,
+    providerId?: string,
+    modelId?: string,
+): { max: number; min: number } {
+    const parseLimit = (value: number | string | undefined): number => {
+        if (value === undefined) {
+            return 0
+        }
+        if (typeof value === "number") {
+            return value
+        }
+        const pct = parseFloat(value.replace("%", ""))
+        if (Number.isNaN(pct)) {
+            return 0
+        }
+        return Math.round((Math.max(0, Math.min(100, pct)) / 100) * state.modelContextLimit)
+    }
+
+    const providerModel = providerId && modelId ? `${providerId}/${modelId}` : undefined
+
+    const modelMin = providerModel ? config.compress.modelMinLimits?.[providerModel] : undefined
+    const modelMax = providerModel ? config.compress.modelMaxLimits?.[providerModel] : undefined
+
+    return {
+        max: parseLimit(modelMax ?? config.compress.maxContextLimit),
+        min: parseLimit(modelMin ?? config.compress.minContextLimit),
+    }
 }
