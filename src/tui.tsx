@@ -34,33 +34,41 @@ export default Plugin.define({
             ),
         })
 
-        context.keymap.layer(() => ({
-            mode: "global",
-            priority: 10,
-            commands: [
-                {
-                    id: "opencodev2-slim.panel",
-                    title: "Show Slim Context Panel",
-                    group: "Slim",
-                    palette: true,
-                    slash: { name: "panel", aliases: ["slim-panel"] },
-                    enabled: true,
-                    suggested: true,
-                    run: async () => {
-                        const opened = context.ui.panel.open(PANEL_NAME, {
-                            presentation: "panel",
-                        })
-                        if (!opened) {
-                            context.ui.toast.show({
-                                title: "Slim Panel",
-                                message: "No active session found. Open a session first.",
-                                variant: "warning",
-                            })
-                        }
-                    },
-                },
-            ],
-        }))
+        // Register the command/shortcut inside the "app" slot render, where the
+        // keymap provider is available (consistent with OpenCode V2 CLI plugins).
+        context.ui.slot({
+            append: "app",
+            render: () => {
+                context.keymap.layer(() => ({
+                    mode: "global",
+                    priority: 10,
+                    commands: [
+                        {
+                            id: "opencodev2-slim.panel",
+                            title: "Show Slim Context Panel",
+                            group: "Slim",
+                            palette: true,
+                            slash: { name: "panel", aliases: ["slim-panel"] },
+                            enabled: true,
+                            suggested: true,
+                            run: async () => {
+                                const opened = context.ui.panel.open(PANEL_NAME, {
+                                    presentation: "panel",
+                                })
+                                if (!opened) {
+                                    context.ui.toast.show({
+                                        title: "Slim Panel",
+                                        message: "No active session found. Open a session first.",
+                                        variant: "warning",
+                                    })
+                                }
+                            },
+                        },
+                    ],
+                }))
+                return null
+            },
+        })
 
         context.ui.toast.show({
             title: "Slim Plugin",
