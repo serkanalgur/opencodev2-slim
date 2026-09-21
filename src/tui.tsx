@@ -94,7 +94,14 @@ export function deriveStats(messages: readonly unknown[]): PanelStats {
 }
 
 // Builds a human-readable panel as plain text (injected into the message stream).
-function renderPanelText(sessionID: string, stats: PanelStats): string {
+function renderPanelText(
+    sessionID: string,
+    stats: PanelStats,
+    real?: MeasuredReal | null,
+): string {
+    const limit = real?.contextLimit ?? 0
+    const pct = real?.usagePercent ?? 0
+    const status = real ? (pct >= 90 ? "critical" : pct >= 70 ? "warning" : "healthy") : "n/a"
     const lines: string[] = []
     lines.push("┌─────────────────────────────────────────────────────────────┐")
     lines.push("│                    SLIM CONTEXT PANEL                       │")
@@ -107,20 +114,65 @@ function renderPanelText(sessionID: string, stats: PanelStats): string {
     lines.push(`│   Tool calls: ${stats.toolCalls}  Compactions: ${stats.compactionCount}`)
     lines.push(`│ Tokens (est): User ${stats.tokensByRole.user} | Assistant ${stats.tokensByRole.assistant} | System ${stats.tokensByRole.system}`)
     lines.push(`│ Total token estimate: ${stats.totalTokens}`)
+    if (real) {
+        lines.push("├─────────────────────────────────────────────────────────────┤")
+        lines.push(`│ Measured tokens: ${real.tokens}  (${pct}% of ${limit})  [${status}]`)
+        if (real.cost > 0) lines.push(`│ Cost: $${real.cost.toFixed(6)}`)
+        lines.push(`│ Model: ${real.model}`)
+    }
     lines.push("└─────────────────────────────────────────────────────────────┘")
     return lines.join("\n")
 }
 
-// Resolves the "current" session: the focused session if any, else the most recent.
+// Resolves the "current" session: the router-focused session if any, else the most recent.
 function resolveCurrentSession(context: any): string | null {
     const sessions = context.data.session.list() || []
     if (sessions.length === 0) return null
-    // Prefer the focused session if exposed; otherwise fall back to the first.
-    const focused = context.router?.current?.()
-    if (focused && typeof focused === "object" && "sessionID" in focused) {
-        return focused.sessionID as string
+    // The TUI host exposes the active route via context.ui.router (not context.router).
+    const route = context.ui?.router?.current?.()
+    if (route && typeof route === "object" && "sessionID" in route) {
+        return route.sessionID as string
     }
     return sessions[0].id
+}
+
+// Server-measured context numbers for a session (Session.Info.tokens + cost + model),
+// mirroring what the `panel` tool in index.ts reads via ctx.session.get().
+interface MeasuredReal {
+    tokens: number
+    cost: number
+    contextLimit: number
+    model: string
+    usagePercent: number
+}
+
+async function measureSession(context: any, sessionID: string): Promise<MeasuredReal | null> {
+    try {
+        const info: any = await context.client.session.get({ sessionID })
+        if (!info) return null
+        const tokens: any = info.tokens ?? {}
+        const tokenCount =
+            (typeof tokens.input === "number" ? tokens.input : 0) +
+            (typeof tokens.output === "number" ? tokens.output : 0) +
+            (typeof tokens.reasoning === "number" ? tokens.reasoning : 0) +
+            (typeof tokens.cache?.read === "number" ? tokens.cache.read : 0) +
+            (typeof tokens.cache?.write === "number" ? tokens.cache.write : 0)
+        const contextLimit: number =
+            typeof info.model?.limit?.context === "number" && info.model.limit.context > 0
+                ? info.model.limit.context
+                : 200000
+        const usagePercent =
+            contextLimit > 0 ? Math.min(100, Math.round((tokenCount / contextLimit) * 100)) : 0
+        return {
+            tokens: tokenCount,
+            cost: typeof info.cost === "number" ? info.cost : 0,
+            contextLimit,
+            model: info.model?.id || "unknown",
+            usagePercent,
+        }
+    } catch {
+        return null
+    }
 }
 
 export default Plugin.define({
@@ -160,10 +212,14 @@ export default Plugin.define({
                                 }
 
                                 try {
+                                    // Make sure the cached transcript is loaded before reading it.
+                                    await context.data.session.message.sync(sessionID)
                                     const messages =
                                         context.data.session.message.list(sessionID) || []
+                                    // Prefer live server-measured context numbers when available.
+                                    const real = await measureSession(context, sessionID)
                                     const stats = deriveStats(messages)
-                                    const text = renderPanelText(sessionID, stats)
+                                    const text = renderPanelText(sessionID, stats, real)
                                     // Inject the panel as plain text into the session stream,
                                     // so it doesn't take over OpenCode's own panel UI.
                                     await context.client.session.synthetic({
