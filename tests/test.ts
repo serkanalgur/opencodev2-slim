@@ -1,7 +1,17 @@
 import { describe, it } from "node:test"
 import assert from "node:assert"
 import { countTokens, shouldCompress, getMessageText, getToolResultContent } from "../src/lib/compress"
-import { pruneMessages } from "../src/lib/strategies"
+import {
+    pruneMessages,
+    registerCompressionBlock,
+    syncCompressionBlocks,
+    applyCompressedRanges,
+    injectLimitNudges,
+    purgeStaleToolErrors,
+    pruneInPlace,
+    buildCompressionSummary,
+} from "../src/lib/strategies"
+import { resolveCompressLimits } from "../src/lib/config"
 import { buildPanelData, renderPanel } from "../src/lib/tui"
 import { deriveStats } from "../src/tui"
 import type { MessageWithParts, SessionState, SlimConfig } from "../src/lib/types"
@@ -360,5 +370,387 @@ describe("CLI Panel Stats", () => {
             },
         ])
         assert.strictEqual(stats.toolCalls, 1)
+    })
+})
+
+// ─── DCP Compression Blocks ────────────────────────────────────────────────
+
+function makeConfig(overrides: Partial<SlimConfig["compress"]> = {}): SlimConfig {
+    return {
+        enabled: true,
+        debug: false,
+        compress: {
+            enabled: true,
+            mode: "range",
+            permission: "allow",
+            maxContextLimit: 100000,
+            minContextLimit: 50000,
+            nudgeFrequency: 5,
+            iterationNudgeThreshold: 15,
+            nudgeForce: "soft",
+            protectUserMessages: false,
+            protectedTools: [],
+            ...overrides,
+        },
+        strategies: {
+            deduplication: { enabled: true, protectedTools: [] },
+            purgeErrors: { enabled: true, turns: 4, protectedTools: [] },
+        },
+        adaptive: { enabled: true, learningRate: 0.1, minCompressionRatio: 0.3 },
+        costAware: { enabled: true, cacheBoostFactor: 0.5 },
+        persistence: { enabled: true, directory: "/tmp/slim-test" },
+    }
+}
+
+function makeState(): SessionState {
+    return {
+        sessionId: "s1",
+        modelContextLimit: 200000,
+        currentTokenCount: 0,
+        compressionCount: 0,
+        lastCompressionTime: 0,
+        manualMode: false,
+        compressPermission: null,
+        compressionHistory: [],
+        averageCompressionRatio: 0,
+        toolCalls: new Map(),
+        compressionBlocks: [],
+        nextBlockId: 1,
+        nudges: { contextLimitAnchors: [], turnNudgeAnchors: [], iterationNudgeAnchors: [] },
+    }
+}
+
+function rawMessage(id: string, role = "user", text = "hello"): any {
+    return { id, role, content: [{ type: "text", text }] }
+}
+
+describe("DCP Compression Blocks", () => {
+    it("should replace covered messages with summary at the anchor", () => {
+        const state = makeState()
+        const messages = [
+            rawMessage("1"),
+            rawMessage("2"),
+            rawMessage("3", "assistant", "work"),
+            rawMessage("4"),
+        ]
+
+        registerCompressionBlock(state, {
+            coveredIds: ["1", "2"],
+            anchorMessageId: "3",
+            summary: "## Compression Summary\nwork done",
+            topic: "old work",
+        })
+        syncCompressionBlocks(state, new Set(["1", "2", "3", "4"]))
+
+        const filtered = applyCompressedRanges(state, messages)
+        assert.strictEqual(filtered.length, 3) // summary + "3" + "4"
+        assert.strictEqual(filtered[0].id, "slim-summary-1")
+        assert.ok(filtered[0].content[0].text.includes("Compression Summary"))
+        assert.ok(!filtered.some((m) => m.id === "1" || m.id === "2"), "covered dropped")
+    })
+
+    it("should deactivate a block when its anchor disappears", () => {
+        const state = makeState()
+        registerCompressionBlock(state, {
+            coveredIds: ["1"],
+            anchorMessageId: "2",
+            summary: "S",
+            topic: "t",
+        })
+
+        // Anchor "2" no longer present in the outgoing list.
+        syncCompressionBlocks(state, new Set(["1"]))
+        const filtered = applyCompressedRanges(state, [rawMessage("1"), rawMessage("2")])
+
+        assert.strictEqual(filtered.length, 2, "nothing replaced when inactive")
+        assert.ok(!filtered.some((m) => m.id === "slim-summary-1"))
+    })
+
+    it("should not replace when nothing is compressed", () => {
+        const state = makeState()
+        const messages = [rawMessage("1"), rawMessage("2")]
+        const filtered = applyCompressedRanges(state, messages)
+        assert.strictEqual(filtered, messages)
+    })
+
+    it("newer block consumes an older block anchored inside its range", () => {
+        const state = makeState()
+        registerCompressionBlock(state, {
+            coveredIds: ["1", "2"],
+            anchorMessageId: "3",
+            summary: "A summary",
+            topic: "a",
+        })
+        registerCompressionBlock(state, {
+            coveredIds: ["3", "4"],
+            anchorMessageId: "5",
+            summary: "B summary",
+            topic: "b",
+        })
+
+        const messages = [
+            rawMessage("1"),
+            rawMessage("2"),
+            rawMessage("3"),
+            rawMessage("4"),
+            rawMessage("5"),
+            rawMessage("6"),
+        ]
+        syncCompressionBlocks(state, new Set(messages.map((m) => m.id)))
+
+        const filtered = applyCompressedRanges(state, messages)
+        assert.deepStrictEqual(
+            filtered.map((m) => m.id),
+            ["slim-summary-2", "5", "6"],
+        )
+        assert.ok(filtered[0].content[0].text.includes("B summary"), "newest summary wins")
+    })
+})
+
+// ─── DCP Limit Rules ───────────────────────────────────────────────────────
+
+describe("DCP Limit Rules", () => {
+    it("resolves absolute limits by default", () => {
+        const limits = resolveCompressLimits(makeConfig(), makeState())
+        assert.deepStrictEqual(limits, { max: 100000, min: 50000 })
+    })
+
+    it("resolves percent limits against the model context window", () => {
+        const config = makeConfig({ maxContextLimit: "80%", minContextLimit: "40%" })
+        const state = makeState()
+        const limits = resolveCompressLimits(config, state)
+        assert.deepStrictEqual(limits, { max: 160000, min: 80000 })
+    })
+
+    it("prefers per-model overrides over global limits", () => {
+        const config = makeConfig({
+            modelMaxLimits: { "anthropic/claude": 50000 },
+            modelMinLimits: { "anthropic/claude": 10000 },
+        })
+        const limits = resolveCompressLimits(config, makeState(), "anthropic", "claude")
+        assert.deepStrictEqual(limits, { max: 50000, min: 10000 })
+    })
+
+    it("anchors a context-limit nudge when over the max limit", () => {
+        const state = makeState()
+        const messages = [
+            rawMessage("1"),
+            rawMessage("2", "assistant", "work"),
+            rawMessage("3"),
+        ]
+
+        injectLimitNudges(state, makeConfig(), messages, 150000, { max: 100000, min: 50000 })
+
+        assert.strictEqual(state.nudges?.contextLimitAnchors.length, 1)
+        const last = messages[2]
+        assert.ok(
+            last.content.some(
+                (p: any) => p.type === "text" && p.text.includes("Context at capacity"),
+            ),
+            "nudge appended to the anchored (last) message",
+        )
+    })
+
+    it("does not grow anchors within nudgeFrequency", () => {
+        const state = makeState()
+        const messages = [
+            rawMessage("1"),
+            rawMessage("2", "assistant", "a"),
+            rawMessage("3"),
+            rawMessage("4"),
+            rawMessage("5"),
+            rawMessage("6"),
+        ]
+        const limits = { max: 100000, min: 50000 }
+
+        injectLimitNudges(state, makeConfig(), messages, 150000, limits)
+        const first = state.nudges!.contextLimitAnchors.length
+        injectLimitNudges(state, makeConfig(), messages, 150000, limits)
+
+        assert.strictEqual(state.nudges!.contextLimitAnchors.length, first)
+    })
+
+    it("clears anchors when the model already ran compress", () => {
+        const state = makeState()
+        const messages = [
+            rawMessage("1"),
+            {
+                id: "2",
+                role: "assistant",
+                content: [
+                    { type: "text", text: "ok" },
+                    { type: "tool-call", name: "compress", input: { focus: "x" } },
+                ],
+            },
+        ]
+        state.nudges!.contextLimitAnchors = ["2"]
+
+        injectLimitNudges(state, makeConfig(), messages, 150000, { max: 100000, min: 50000 })
+        assert.strictEqual(state.nudges!.contextLimitAnchors.length, 0)
+    })
+
+    it("does nothing when compress is denied", () => {
+        const state = makeState()
+        const messages = [rawMessage("1"), rawMessage("2", "assistant")]
+        injectLimitNudges(state, makeConfig({ permission: "deny" }), messages, 150000, {
+            max: 100000,
+            min: 50000,
+        })
+        assert.strictEqual(state.nudges?.contextLimitAnchors.length, 0)
+    })
+})
+
+// ─── Pruning Strategies ────────────────────────────────────────────────────
+
+describe("Pruning Strategies", () => {
+    it("purges stale errored tool inputs but keeps recent messages", () => {
+        const messages = [
+            {
+                id: "1",
+                role: "assistant",
+                content: [
+                    {
+                        type: "tool-call",
+                        toolCallID: "c1",
+                        name: "edit",
+                        input: { content: "A".repeat(500) },
+                    },
+                ],
+            },
+            {
+                id: "2",
+                role: "tool",
+                content: [
+                    { type: "tool-result", toolCallID: "c1", result: { type: "error", value: "boom" } },
+                ],
+            },
+            { id: "3", role: "user", content: [{ type: "text", text: "ok" }] },
+            {
+                id: "4",
+                role: "assistant",
+                content: [
+                    {
+                        type: "tool-call",
+                        toolCallID: "c2",
+                        name: "edit",
+                        input: { content: "B".repeat(500) },
+                    },
+                ],
+            },
+            {
+                id: "5",
+                role: "tool",
+                content: [
+                    { type: "tool-result", toolCallID: "c2", result: { type: "error", value: "boom2" } },
+                ],
+            },
+            { id: "6", role: "user", content: [{ type: "text", text: "recent" }] },
+        ]
+
+        purgeStaleToolErrors(messages, 4)
+
+        // c1 (stale, index 0) is purged; c2 (recent, index 3) is untouched.
+        assert.ok(messages[0].content[0].input.content.startsWith("[input removed"))
+        assert.strictEqual(messages[3].content[0].input.content, "B".repeat(500))
+    })
+})
+
+// ─── Nudge idempotency ─────────────────────────────────────────────────────
+
+describe("Nudge Idempotency", () => {
+    it("does not duplicate a nudge when the usage percentage changes", () => {
+        const state = makeState()
+        const config = makeConfig()
+        const messages = [
+            rawMessage("1"),
+            rawMessage("2", "assistant", "work"),
+            rawMessage("3"),
+        ]
+        const limits = { max: 100000, min: 50000 }
+
+        injectLimitNudges(state, config, messages, 101000, limits) // 101%
+        injectLimitNudges(state, config, messages, 102000, limits) // 102% — same anchor
+
+        const textParts = messages[2].content.filter((p: any) => p.type === "text")
+        const nudges = textParts.filter((p: any) => p.text.includes("[[slim:context-limit]]"))
+        assert.strictEqual(nudges.length, 1, "nudge appended exactly once despite % change")
+    })
+})
+
+// ─── Deduplication correctness ─────────────────────────────────────────────
+
+describe("Deduplication Correctness", () => {
+    it("keeps distinct messages that share a common prefix", () => {
+        const messages = [
+            rawMessage("1", "user", "Same start " + "x".repeat(300)),
+            rawMessage("2", "user", "Same start " + "x".repeat(299) + "y"),
+        ]
+        pruneInPlace(messages, makeConfig())
+        assert.strictEqual(messages.length, 2, "shared prefix must not be deduplicated")
+    })
+
+    it("removes only truly identical messages", () => {
+        const messages = [
+            rawMessage("1", "user", "identical content"),
+            rawMessage("2", "user", "identical content"),
+        ]
+        pruneInPlace(messages, makeConfig())
+        assert.strictEqual(messages.length, 1)
+    })
+})
+
+// ─── Compression block hygiene ─────────────────────────────────────────────
+
+describe("Compression Block Hygiene", () => {
+    it("drops orphaned inactive blocks when all referenced messages are gone", () => {
+        const state = makeState()
+        registerCompressionBlock(state, {
+            coveredIds: ["1"],
+            anchorMessageId: "2",
+            summary: "S",
+            topic: "t",
+        })
+
+        // Only unrelated messages remain (e.g. after OpenCode compaction).
+        syncCompressionBlocks(state, new Set(["99"]))
+
+        assert.strictEqual(state.compressionBlocks?.length, 0, "orphaned block forgotten")
+    })
+
+    it("keeps blocks that still reference a live message", () => {
+        const state = makeState()
+        registerCompressionBlock(state, {
+            coveredIds: ["1"],
+            anchorMessageId: "2",
+            summary: "S",
+            topic: "t",
+        })
+
+        syncCompressionBlocks(state, new Set(["2"])) // anchor still alive
+        assert.strictEqual(state.compressionBlocks?.length, 1)
+        assert.strictEqual(state.compressionBlocks![0].active, true)
+    })
+})
+
+// ─── Protected user messages ───────────────────────────────────────────────
+
+describe("Protected User Messages", () => {
+    it("preserves user text verbatim in the summary when enabled", async () => {
+        const messages = [
+            {
+                info: { id: "1", role: "user", sessionID: "s1", time: { created: 0 } } as any,
+                parts: [{ type: "text", text: "Please refactor the auth module" }] as any,
+            },
+            {
+                info: { id: "2", role: "assistant", sessionID: "s1", time: { created: 0 } } as any,
+                parts: [{ type: "text", text: "Done" }] as any,
+            },
+        ]
+
+        const withProtection = await buildCompressionSummary(messages, "auth work", [], true)
+        assert.ok(withProtection.includes("Please refactor the auth module"))
+
+        const withoutProtection = await buildCompressionSummary(messages, "auth work", [], false)
+        assert.ok(!withoutProtection.includes("Please refactor the auth module"))
     })
 })

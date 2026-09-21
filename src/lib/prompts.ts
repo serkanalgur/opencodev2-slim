@@ -6,11 +6,16 @@ You have access to context management tools. Use them wisely:
 
 ### compress tool
 Use \`compress\` to reduce context size when it gets large. It supports:
+- Range mode: Compress a specific message range (start/end indices) into one summary
+- Topic mode: Compress messages matching a topic keyword
 - Auto mode: Intelligently selects what to compress
-- Range mode: Compress specific message range
-- Topic mode: Compress messages matching a topic
 
 Example: \`compress({ focus: "old exploration" })\`
+
+Compressed ranges are replaced by their summary on outgoing requests, so the
+model keeps the essential information while token usage drops on every
+subsequent request. Protected tool results (task, skill, todowrite, todoread)
+are preserved inside the summary.
 
 ### panel tool
 Use \`panel\` to view current context usage and statistics.
@@ -30,19 +35,30 @@ export function getCompressToolDescription(): string {
 - Range mode: Compress specific message range (start/end indices)
 - Topic mode: Compress messages matching a topic keyword
 
-The compression creates a summary preserving key information while removing redundancy.`
+The compression creates a summary preserving key information (including
+protected tool outputs) and replaces the selected messages with that summary on
+future requests, so the context stays small.`
 }
 
-export function getNudgeMessage(reason: string, currentTokens: number, maxTokens: number): string {
-    const percent = Math.round((currentTokens / maxTokens) * 100)
-    return `💡 **Context Optimization Available**
+// ─── DCP-style limit nudges ────────────────────────────────────────────────
+//
+// Every nudge carries a stable marker so the pipeline can detect an existing
+// nudge regardless of its dynamic content (percentages change every request).
 
-${reason} (${percent}% used)
+export const NUDGE_MARKERS = {
+    contextLimit: "[[slim:context-limit]]",
+    turn: "[[slim:turn]]",
+    iteration: "[[slim:iteration]]",
+} as const
 
-Consider using the \`compress\` tool to free up context space:
-\`\`\`
-compress({ focus: "describe what to compress" })
-\`\`\`
+export function contextLimitNudge(percent: number, maxTokens: number): string {
+    return `${NUDGE_MARKERS.contextLimit}\n\n> ⚠️ **Context at capacity: ${percent}% of ${maxTokens.toLocaleString()} tokens.** Older completed work should be compressed now to keep the session efficient. Call \`compress\` with a focus describing the oldest exchange, e.g. \`compress({ focus: "initial exploration" })\`. Past ranges are replaced by summaries to avoid re-sending tokens.`
+}
 
-This will create a summary of older messages, preserving key information while freeing tokens.`
+export function turnNudge(percent: number): string {
+    return `${NUDGE_MARKERS.turn}\n\n> 💡 **Context is getting large (${percent}% of limit).** When you finish the current task, consider calling \`compress\` on the completed portion to keep the session fast and cheap.`
+}
+
+export function iterationNudge(percent: number): string {
+    return `${NUDGE_MARKERS.iteration}\n\n> 💡 **Many tool iterations since the last user message (${percent}% of limit used).** If the explored subtree is done, call \`compress({ focus: "exploration so far" })\` to replace it with a summary.`
 }
