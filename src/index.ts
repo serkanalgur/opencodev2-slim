@@ -16,6 +16,7 @@ import {
     pruneInPlace,
     injectLimitNudges,
     findLastUserMessage,
+    autoCompress,
 } from "./lib/strategies"
 import { getSystemPrompt, getCompressToolDescription } from "./lib/prompts"
 import { buildPanelData, renderPanel } from "./lib/tui"
@@ -385,12 +386,12 @@ export default Plugin.define({
             event.system.push({ type: "text", text: getSystemPrompt() })
         })
 
-        // ─── Messages Transform Hook (sync) ──────────────────────────────
+        // ─── Messages Transform Hook (sync → async) ─────────────────────────
         // DCP pipeline for every outgoing request: sync compression blocks,
         // replace covered ranges with summary placeholders, prune (dedup +
         // purge errored tool inputs), then apply DCP limit rules as anchored
         // nudges. Session history is never modified — only this request.
-        await ctx.session.hook("context", (event) => {
+        await ctx.session.hook("context", async (event) => {
             const sessionId = event.sessionID
             const config = getConfig(sessionId)
             if (!config.enabled) return
@@ -441,6 +442,17 @@ export default Plugin.define({
                 lastUser?.model?.id?.split?.("/").slice(1).join("/")
             const limits = resolveCompressLimits(config, state, providerId, modelId)
             injectLimitNudges(state, config, event.messages, totalTokens, limits)
+
+            // 5) Auto-compress: when over the max limit, directly compress old
+            //    messages without waiting for the model to call the compress tool.
+            //    Registers a compression block so future requests use the summary.
+            if (totalTokens > limits.max) {
+                try {
+                    await autoCompress(state, config, event.messages, totalTokens, limits)
+                } catch {
+                    // Best-effort: auto-compress failure should never break the request.
+                }
+            }
 
             saveSessionState(state, config.persistence.directory)
         })
