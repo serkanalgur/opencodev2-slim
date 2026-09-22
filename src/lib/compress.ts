@@ -2,34 +2,71 @@ import type { MessageWithParts } from "./types"
 
 // ─── Token Counting ─────────────────────────────────────────────────────────
 
-let tokenizer: any = null
+let anthropicTokenizer: any = null
+let tiktokenTokenizer: any = null
 
-async function getTokenizer() {
-    if (!tokenizer) {
+async function getAnthropicTokenizer() {
+    if (!anthropicTokenizer) {
         try {
             const mod = await import("@anthropic-ai/tokenizer")
-            tokenizer = mod
+            anthropicTokenizer = mod
         } catch {
             return null
         }
     }
-    return tokenizer
+    return anthropicTokenizer
 }
 
+async function getTiktoken() {
+    if (!tiktokenTokenizer) {
+        try {
+            const mod = await import("tiktoken")
+            tiktokenTokenizer = mod
+        } catch {
+            return null
+        }
+    }
+    return tiktokenTokenizer
+}
+
+/**
+ * Count tokens for the given text. Tries providers in order:
+ * 1. Anthropic tokenizer (if available) — most accurate for Claude models
+ * 2. tiktoken (if available) — accurate for OpenAI models
+ * 3. Rough estimation: ~4 chars per token (best guess for mixed content)
+ */
 export async function countTokens(text: string): Promise<number> {
     if (!text) return 0
 
-    const tok = await getTokenizer()
-    if (tok && tok.encode) {
+    // Try Anthropic tokenizer first
+    const anth = await getAnthropicTokenizer()
+    if (anth && anth.encode) {
         try {
-            return tok.encode(text).length
+            return anth.encode(text).length
         } catch {
-            // Fallback to estimation
+            // Fall through
         }
     }
 
-    // Rough estimation: ~4 chars per token for English
-    return Math.ceil(text.length / 4)
+    // Try tiktoken
+    const tk = await getTiktoken()
+    if (tk && tk.encoding_for_model) {
+        try {
+            const enc = tk.encoding_for_model("gpt-4")
+            const tokens = enc.encode(text)
+            enc.free()
+            return tokens.length
+        } catch {
+            // Fall through
+        }
+    }
+
+    // Rough estimation: ~4 chars per token for English, ~2-3 for CJK
+    // Count non-ASCII characters for a slightly better estimate
+    const nonAsciiCount = (text.match(/[^\x00-\x7F]/g) || []).length
+    const asciiLen = text.length - nonAsciiCount
+    const estimatedTokens = Math.ceil(asciiLen / 4) + Math.ceil(nonAsciiCount / 2)
+    return Math.max(1, estimatedTokens)
 }
 
 // ─── Message Text Extraction ────────────────────────────────────────────────
@@ -63,6 +100,13 @@ export function getToolResultContent(msg: MessageWithParts): string {
                 results.push(String(val).slice(0, 500))
             }
         }
+        // SessionMessageInfo format: tool with state.status === "completed"
+        if (part.type === "tool" && part.state?.status === "completed") {
+            const output = part.state.content ?? part.state.output
+            if (output !== undefined && output !== null) {
+                results.push(String(output).slice(0, 500))
+            }
+        }
     }
 
     return results.join("\n")
@@ -72,7 +116,7 @@ export function getToolName(msg: MessageWithParts): string | null {
     for (const part of msg.parts) {
         // v1 SDK format
         if (part.type === "tool") {
-            return part.tool || null
+            return part.tool || part.name || null
         }
         // v2 AI format
         if (part.type === "tool-call") {

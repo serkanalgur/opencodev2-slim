@@ -69,6 +69,8 @@ export function syncCompressionBlocks(state: SessionState, presentIds: Set<strin
  * Produces the outgoing message list: active blocks inject their summary at the
  * anchor and drop every covered message. Returns a new array; the caller should
  * splice it back into the event.
+ *
+ * Handles both Message[] (hook format) and SessionMessageInfo[] (transcript format).
  */
 export function applyCompressedRanges(state: SessionState, messages: any[]): any[] {
     const blocks = (state.compressionBlocks ?? []).filter((b) => b.active)
@@ -83,15 +85,30 @@ export function applyCompressedRanges(state: SessionState, messages: any[]): any
 
     const result: any[] = []
     for (const msg of messages) {
+        // Extract ID from various formats
         const id = (msg && (msg.id ?? msg.info?.id)) as string | undefined
         if (typeof id === "string") {
             const block = byAnchor.get(id)
             if (block && block.summary) {
-                result.push({
-                    role: "user",
-                    id: `slim-summary-${block.blockId}`,
-                    content: [{ type: "text", text: block.summary }],
-                })
+                // Detect format: if messages have 'role', it's Message format.
+                // If they have 'type', it's SessionMessageInfo format.
+                const isHookFormat = messages.length > 0 && "role" in (messages[0] ?? {})
+                if (isHookFormat) {
+                    // Hook format: inject as a synthetic user message
+                    result.push({
+                        role: "user",
+                        id: `slim-summary-${block.blockId}`,
+                        content: [{ type: "text", text: block.summary }],
+                    })
+                } else {
+                    // Transcript / SessionMessageInfo format
+                    result.push({
+                        type: "user",
+                        id: `slim-summary-${block.blockId}`,
+                        text: block.summary,
+                        time: { created: Date.now() },
+                    })
+                }
             }
             if (covered.has(id)) {
                 continue
@@ -342,18 +359,32 @@ export function applyDeduplication(
  * DCP purge-errors: for tool calls whose result is an error, remove the large
  * string inputs once the message is at least `turns` positions behind the end
  * of the conversation. Error messages themselves are preserved.
+ * Handles both hook format (content with tool-call/tool-result parts) and
+ * SessionMessageInfo format (content with tool parts).
  */
 export function purgeStaleToolErrors(messages: any[], turns: number): void {
     const n = messages.length
     if (n === 0) return
 
+    // Collect errored call IDs from all message formats
     const erroredCallIds = new Set<string>()
     for (const msg of messages) {
-        for (const part of msg?.content ?? msg?.parts ?? []) {
-            if (part?.type !== "tool-result") continue
-            if (part.result?.type !== "error") continue
-            const callId = part.toolCallID ?? part.callID
-            if (callId) erroredCallIds.add(String(callId))
+        const contentArr = msg?.content ?? msg?.parts ?? []
+        if (!Array.isArray(contentArr)) continue
+
+        for (const part of contentArr) {
+            // Format 1: tool-result with result.type === "error"
+            if (part?.type === "tool-result") {
+                if (part.result?.type === "error") {
+                    const callId = part.toolCallID ?? part.callID
+                    if (callId) erroredCallIds.add(String(callId))
+                }
+            }
+            // Format 2: tool with state.status === "error"
+            if (part?.type === "tool" && part?.state?.status === "error") {
+                const callId = part.callID
+                if (callId) erroredCallIds.add(String(callId))
+            }
         }
     }
     if (erroredCallIds.size === 0) return
@@ -362,15 +393,33 @@ export function purgeStaleToolErrors(messages: any[], turns: number): void {
     for (let i = 0; i < n; i++) {
         if (i > n - turnsEffective - 1) continue // too recent — keep
         const msg = messages[i]
-        for (const part of msg?.content ?? msg?.parts ?? []) {
-            if (part?.type !== "tool-call") continue
-            const callId = part.toolCallID ?? part.callID
-            if (!callId || !erroredCallIds.has(String(callId))) continue
-            const input = part.input
-            if (input && typeof input === "object") {
-                for (const key of Object.keys(input)) {
-                    if (typeof input[key] === "string" && input[key].length > 80) {
-                        input[key] = "[input removed due to failed tool call]"
+        const contentArr = msg?.content ?? msg?.parts ?? []
+        if (!Array.isArray(contentArr)) continue
+
+        for (const part of contentArr) {
+            // Format 1: tool-call part
+            if (part?.type === "tool-call") {
+                const callId = part.toolCallID ?? part.callID
+                if (!callId || !erroredCallIds.has(String(callId))) continue
+                const input = part.input
+                if (input && typeof input === "object") {
+                    for (const key of Object.keys(input)) {
+                        if (typeof input[key] === "string" && input[key].length > 80) {
+                            input[key] = "[input removed due to failed tool call]"
+                        }
+                    }
+                }
+            }
+            // Format 2: tool part with state containing input
+            if (part?.type === "tool") {
+                const callId = part.callID
+                if (!callId || !erroredCallIds.has(String(callId))) continue
+                const state = part.state
+                if (state?.input && typeof state.input === "object") {
+                    for (const key of Object.keys(state.input)) {
+                        if (typeof state.input[key] === "string" && state.input[key].length > 80) {
+                            state.input[key] = "[input removed due to failed tool call]"
+                        }
                     }
                 }
             }
@@ -417,11 +466,30 @@ export function pruneInPlace(messages: any[], config: SlimConfig): void {
 
 // ─── DCP limit rules → anchored nudges ─────────────────────────────────────
 
+/**
+ * Detects whether a message contains a compress tool call.
+ * Handles both the hook format (content array with tool-call parts) and the
+ * SessionMessageInfo format (assistant content with tool parts).
+ */
 export function messageHasCompress(msg: any): boolean {
-    const content = msg?.content ?? msg?.parts ?? []
-    return content.some(
+    // Format 1: Hook format — content array with tool-call parts
+    const content1 = msg?.content ?? msg?.parts ?? []
+    const hasInContent = content1.some(
         (part: any) => part?.type === "tool-call" && part?.name === "compress",
     )
+    if (hasInContent) return true
+
+    // Format 2: SessionMessageInfo / transcript format — content array with tool parts
+    const content2 = msg?.content ?? []
+    if (Array.isArray(content2)) {
+        for (const part of content2) {
+            if (part?.type === "tool" && part?.name === "compress") return true
+            // Some formats store tool name inside state or as text
+            if (part?.type === "tool" && typeof part?.text === "string" && part.text.includes('"compress"')) return true
+        }
+    }
+
+    return false
 }
 
 export function findLastUserMessage(messages: any[]): any | undefined {
@@ -504,10 +572,16 @@ export function injectLimitNudges(
     messages: any[],
     currentTokens: number,
     limits: { max: number; min: number },
+    providerId?: string,
+    modelId?: string,
 ): void {
     if (config.compress.permission === "deny") return
     if (state.manualMode) return
     if (messages.length === 0) return
+
+    // Store provider/model info on state for external access
+    if (providerId) state._lastProviderId = providerId
+    if (modelId) state._lastModelId = modelId
 
     const nudges = state.nudges ?? {
         contextLimitAnchors: [],
