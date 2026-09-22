@@ -88,6 +88,10 @@ export interface SessionState {
     nextBlockId?: number
     // DCP-style nudge anchors
     nudges?: NudgeState
+
+    // Last resolved provider/model (set by injectLimitNudges)
+    _lastProviderId?: string
+    _lastModelId?: string
 }
 
 /**

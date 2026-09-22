@@ -35,6 +35,9 @@ export function normalizeState(state: SessionState): SessionState {
             ? state.nudges.iterationNudgeAnchors
             : [],
     }
+    // Optional fields — preserve if present, leave undefined if not
+    state._lastProviderId = state._lastProviderId ?? undefined
+    state._lastModelId = state._lastModelId ?? undefined
     return state
 }
 
