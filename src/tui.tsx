@@ -157,17 +157,38 @@ async function measureSession(context: any, sessionID: string): Promise<Measured
             (typeof tokens.reasoning === "number" ? tokens.reasoning : 0) +
             (typeof tokens.cache?.read === "number" ? tokens.cache.read : 0) +
             (typeof tokens.cache?.write === "number" ? tokens.cache.write : 0)
-        const contextLimit: number =
-            typeof info.model?.limit?.context === "number" && info.model.limit.context > 0
-                ? info.model.limit.context
-                : 200000
+
+        // Resolve context limit: try model.list() first, then session info, then default.
+        let contextLimit = 200000
+        const modelID: string = info.model?.id || ""
+        const providerID: string = info.model?.providerID || ""
+
+        try {
+            const modelList: any = await context.client.model.list()
+            const models: any[] = modelList?.data ?? modelList ?? []
+            // Find by exact match (providerID/modelID), then by modelID alone
+            const found = models.find(
+                (m: any) => m.providerID === providerID && m.modelID === modelID,
+            ) || models.find((m: any) => m.modelID === modelID)
+            if (found?.limit?.context && found.limit.context > 0) {
+                contextLimit = found.limit.context
+            }
+        } catch {
+            // Fall through to session info or default
+        }
+
+        // Fallback: session info might have model.limit.context
+        if (contextLimit === 200000 && info.model?.limit?.context && info.model.limit.context > 0) {
+            contextLimit = info.model.limit.context
+        }
+
         const usagePercent =
             contextLimit > 0 ? Math.min(100, Math.round((tokenCount / contextLimit) * 100)) : 0
         return {
             tokens: tokenCount,
             cost: typeof info.cost === "number" ? info.cost : 0,
             contextLimit,
-            model: info.model?.id || "unknown",
+            model: modelID || "unknown",
             usagePercent,
         }
     } catch {
@@ -178,7 +199,7 @@ async function measureSession(context: any, sessionID: string): Promise<Measured
 export default Plugin.define({
     id: "opencodev2-slim.cli",
     setup(context) {
-        // Register the command inside the "app" slot render, where the keymap
+        // Register commands inside the "app" slot render, where the keymap
         // provider is available (consistent with OpenCode V2 CLI plugins).
         context.ui.slot({
             append: "app",
@@ -187,6 +208,7 @@ export default Plugin.define({
                     mode: "global",
                     priority: 10,
                     commands: [
+                        // ─── /panel ────────────────────────────────────
                         {
                             id: "opencodev2-slim.panel",
                             title: "Show Slim Context Panel",
@@ -212,16 +234,12 @@ export default Plugin.define({
                                 }
 
                                 try {
-                                    // Make sure the cached transcript is loaded before reading it.
                                     await context.data.session.message.sync(sessionID)
                                     const messages =
                                         context.data.session.message.list(sessionID) || []
-                                    // Prefer live server-measured context numbers when available.
                                     const real = await measureSession(context, sessionID)
                                     const stats = deriveStats(messages)
                                     const text = renderPanelText(sessionID, stats, real)
-                                    // Inject the panel as plain text into the session stream,
-                                    // so it doesn't take over OpenCode's own panel UI.
                                     await context.client.session.synthetic({
                                         sessionID,
                                         text,
@@ -236,6 +254,210 @@ export default Plugin.define({
                                 }
                             },
                         },
+
+                        // ─── /compress ─────────────────────────────────
+                        {
+                            id: "opencodev2-slim.compress",
+                            title: "Compress Context",
+                            group: "Slim",
+                            palette: true,
+                            slash: {
+                                name: "compress",
+                                aliases: ["slim-compress"],
+                                args: [
+                                    {
+                                        name: "focus",
+                                        description: "What to compress (e.g., 'old exploration')",
+                                        required: false,
+                                    },
+                                ],
+                            },
+                            enabled: true,
+                            suggested: true,
+                            run: async (input: unknown, event: unknown) => {
+                                const sessionID =
+                                    resolveCurrentSession(context) ||
+                                    (event && typeof event === "object" && "sessionID" in event
+                                        ? (event as any).sessionID
+                                        : null)
+
+                                if (!sessionID) {
+                                    context.ui.toast.show({
+                                        title: "Slim Compress",
+                                        message: "No active session found.",
+                                        variant: "warning",
+                                    })
+                                    return
+                                }
+
+                                try {
+                                    const args = (input as any) || {}
+                                    const focus = args.focus || "user-requested compression"
+
+                                    // Inject a synthetic message asking the assistant to compress.
+                                    const prompt = `Please call the compress tool now with: compress({ focus: "${focus}", mode: "auto" })`
+                                    await context.client.session.synthetic({
+                                        sessionID,
+                                        text: prompt,
+                                        description: "slim-compress",
+                                    })
+
+                                    context.ui.toast.show({
+                                        title: "Slim Compress",
+                                        message: `Compression requested: "${focus}". The assistant will process it on the next turn.`,
+                                        variant: "success",
+                                        duration: 3000,
+                                    })
+                                } catch (e) {
+                                    context.ui.toast.show({
+                                        title: "Slim Compress",
+                                        message: `Error: ${e instanceof Error ? e.message : e}`,
+                                        variant: "error",
+                                    })
+                                }
+                            },
+                        },
+
+                        // ─── /status ──────────────────────────────────
+                        {
+                            id: "opencodev2-slim.status",
+                            title: "Show Compact Status",
+                            group: "Slim",
+                            palette: true,
+                            slash: { name: "status", aliases: ["slim-status"] },
+                            enabled: true,
+                            suggested: false,
+                            run: async (input: unknown, event: unknown) => {
+                                const sessionID =
+                                    resolveCurrentSession(context) ||
+                                    (event && typeof event === "object" && "sessionID" in event
+                                        ? (event as any).sessionID
+                                        : null)
+
+                                if (!sessionID) {
+                                    context.ui.toast.show({
+                                        title: "Slim Status",
+                                        message: "No active session found.",
+                                        variant: "warning",
+                                    })
+                                    return
+                                }
+
+                                try {
+                                    const real = await measureSession(context, sessionID)
+                                    if (!real) {
+                                        context.ui.toast.show({
+                                            title: "Slim Status",
+                                            message: "Could not measure session.",
+                                            variant: "warning",
+                                        })
+                                        return
+                                    }
+
+                                    const status =
+                                        real.usagePercent >= 90
+                                            ? "🔴 CRITICAL"
+                                            : real.usagePercent >= 70
+                                              ? "🟡 WARNING"
+                                              : "🟢 HEALTHY"
+
+                                    const text = [
+                                        `**Context Status:** ${status}`,
+                                        `**Usage:** ${real.tokens.toLocaleString()} / ${real.contextLimit.toLocaleString()} tokens (${real.usagePercent}%)`,
+                                        `**Model:** ${real.model}`,
+                                        real.cost > 0 ? `**Cost:** $${real.cost.toFixed(4)}` : "",
+                                    ]
+                                        .filter(Boolean)
+                                        .join("\n")
+
+                                    await context.client.session.synthetic({
+                                        sessionID,
+                                        text,
+                                        description: "slim-status",
+                                    })
+                                } catch (e) {
+                                    context.ui.toast.show({
+                                        title: "Slim Status",
+                                        message: `Error: ${e instanceof Error ? e.message : e}`,
+                                        variant: "error",
+                                    })
+                                }
+                            },
+                        },
+
+                        // ─── /slim-debug ──────────────────────────────
+                        {
+                            id: "opencodev2-slim.debug",
+                            title: "Toggle Slim Debug Mode",
+                            group: "Slim",
+                            palette: true,
+                            slash: { name: "slim-debug", aliases: ["debug-slim"] },
+                            enabled: true,
+                            suggested: false,
+                            run: async (input: unknown, event: unknown) => {
+                                const sessionID =
+                                    resolveCurrentSession(context) ||
+                                    (event && typeof event === "object" && "sessionID" in event
+                                        ? (event as any).sessionID
+                                        : null)
+
+                                if (!sessionID) {
+                                    context.ui.toast.show({
+                                        title: "Slim Debug",
+                                        message: "No active session found.",
+                                        variant: "warning",
+                                    })
+                                    return
+                                }
+
+                                try {
+                                    // Read current config
+                                    const configPath = `${process.env.HOME || "~"}/.config/opencode/slim.jsonc`
+                                    const fs = await import("fs")
+                                    let debug = false
+                                    if (fs.existsSync(configPath)) {
+                                        const content = fs.readFileSync(configPath, "utf-8")
+                                        const match = content.match(/"debug"\s*:\s*(true|false)/)
+                                        if (match) debug = match[1] === "true"
+                                    }
+
+                                    // Toggle
+                                    debug = !debug
+
+                                    // Write back
+                                    const { parse } = await import("jsonc-parser")
+                                    let config: any = {}
+                                    if (fs.existsSync(configPath)) {
+                                        config = parse(fs.readFileSync(configPath, "utf-8")) || {}
+                                    }
+                                    config.debug = debug
+
+                                    const dir = `${process.env.HOME || "~"}/.config/opencode`
+                                    if (!fs.existsSync(dir)) {
+                                        fs.mkdirSync(dir, { recursive: true })
+                                    }
+                                    fs.writeFileSync(
+                                        configPath,
+                                        JSON.stringify(config, null, 2),
+                                        "utf-8",
+                                    )
+
+                                    const text = `**Slim Debug Mode:** ${debug ? "ON 🔴" : "OFF ⚪"}\n\nDebug logs will ${debug ? "now" : "no longer"} appear in the console.`
+
+                                    await context.client.session.synthetic({
+                                        sessionID,
+                                        text,
+                                        description: "slim-debug",
+                                    })
+                                } catch (e) {
+                                    context.ui.toast.show({
+                                        title: "Slim Debug",
+                                        message: `Error: ${e instanceof Error ? e.message : e}`,
+                                        variant: "error",
+                                    })
+                                }
+                            },
+                        },
                     ],
                 }))
                 return null
@@ -243,10 +465,10 @@ export default Plugin.define({
         })
 
         context.ui.toast.show({
-            title: "Slim Plugin",
-            message: "Use /panel to print the context panel as a message.",
+            title: "Slim Plugin v2.1.0",
+            message: "Commands: /panel, /compress, /status, /slim-debug",
             variant: "success",
-            duration: 3000,
+            duration: 4000,
         })
 
         return () => {}
