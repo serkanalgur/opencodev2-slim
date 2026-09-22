@@ -47,27 +47,40 @@ function getConfig(sessionId: string): SlimConfig {
 }
 
 // Resolve the active model's real context limit instead of hard-coding 200k.
-// ctx.model.default() returns { data: ModelInfo | null }, where ModelInfo.limit.context
-// holds the model's context window. Use it directly and only fall back when missing.
-async function resolveModelContextLimit(ctx: any): Promise<number> {
+// ctx.model.default() only returns { providerID, modelID } — no limit info.
+// Use ctx.model.list() to find the full Model.Info which includes limit.context.
+export async function resolveModelContextLimit(ctx: any): Promise<number> {
     try {
-        const selected: { data?: { limit?: { context?: number } } | null } | undefined =
-            await ctx.model.default()
-        const limit = selected?.data?.limit?.context
-        return typeof limit === "number" && limit > 0 ? limit : DEFAULT_MODEL_LIMIT
+        const defaultRef: { providerID?: string; modelID?: string } | undefined =
+            typeof ctx.model.default === "function" ? await ctx.model.default() : undefined
+        const providerID = defaultRef?.providerID
+        const modelID = defaultRef?.modelID
+
+        if (providerID && modelID && typeof ctx.model.list === "function") {
+            const models: Array<{ providerID: string; modelID: string; limit?: { context?: number } }> =
+                ctx.model.list()
+            const found = models.find(
+                (m) => m.providerID === providerID && m.modelID === modelID,
+            )
+            const limit = found?.limit?.context
+            if (typeof limit === "number" && limit > 0) return limit
+        }
+
+        // Fallback: try model.list() for any model with a limit
+        if (typeof ctx.model.list === "function") {
+            const models: Array<{ limit?: { context?: number } }> = ctx.model.list()
+            for (const m of models) {
+                const limit = m.limit?.context
+                if (typeof limit === "number" && limit > 0) return limit
+            }
+        }
     } catch {
-        return DEFAULT_MODEL_LIMIT
+        // Fall through to default
     }
+    return DEFAULT_MODEL_LIMIT
 }
 
-// Compose the exact text used to summarize a transcript (used by compaction).
-function stringifyTranscript(v: unknown): string {
-    // A compact but useful representation of the transcript to be summarized.
-    const text = String(v)
-    return text.length > 4000 ? `${text.slice(0, 4000)}\n…` : text
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── State Management ───────────────────────────────────────────────────────
 
 // Register a DCP-style compression block for the selected range. The range is
 // covered (removed from future outgoing requests) and the summary is injected
@@ -110,18 +123,109 @@ function registerBlockForRange(
     })
 }
 
+/**
+ * Wraps any message format into MessageWithParts for internal processing.
+ * Handles both:
+ * - Raw Message format (from context hook): { id, role, parts/content }
+ * - SessionMessageInfo format (from session.context()): { id, type, text/content }
+ * - Transcript format (from TUI): { type, text, content }
+ */
 function wrapAsMessageWithParts(msg: any): MessageWithParts {
-    const msgInfo = msg.info
-    const id = (msg && (msg.id || msgInfo?.id)) || ""
-    const role = (msg && (msg.role || msgInfo?.role)) || "user"
+    // Determine the role from various possible fields
+    let role = "assistant"
+    if (msg?.role) {
+        role = msg.role
+    } else if (msg?.type) {
+        // SessionMessageInfo / transcript format: type -> role mapping
+        const type = msg.type as string
+        if (type === "user" || type === "shell" || type === "synthetic") {
+            role = "user"
+        } else if (type === "assistant") {
+            role = "assistant"
+        } else if (type === "compaction" || type === "agent" || type === "model" || type === "skill") {
+            role = "system"
+        } else {
+            role = "assistant"
+        }
+    }
+
+    // Extract ID
+    const id = msg?.id ?? msg?.info?.id ?? ""
+
+    // Build parts array from whatever format we receive
+    const parts: any[] = []
+
+    if (role === "user") {
+        // User messages: text can be in msg.text, msg.content, or msg.parts
+        if (typeof msg.text === "string" && msg.text) {
+            parts.push({ type: "text", text: msg.text })
+        } else if (Array.isArray(msg.parts)) {
+            for (const p of msg.parts) {
+                if (p?.type === "text" && p.text) {
+                    parts.push({ type: "text", text: p.text })
+                }
+            }
+        } else if (Array.isArray(msg.content)) {
+            for (const p of msg.content) {
+                if (p?.type === "text" && p.text) {
+                    parts.push({ type: "text", text: p.text })
+                }
+            }
+        }
+    } else if (role === "assistant") {
+        // Assistant messages: content can be an array of parts
+        const contentArr = msg.content ?? msg.parts ?? []
+        if (Array.isArray(contentArr)) {
+            for (const p of contentArr) {
+                if (p?.type === "text") {
+                    parts.push({ type: "text", text: p.text || "" })
+                } else if (p?.type === "tool") {
+                    // SessionMessageAssistantTool format: has callID, name, state
+                    const state = p.state
+                    if (state?.status === "completed") {
+                        parts.push({
+                            type: "tool-result",
+                            toolCallID: p.callID,
+                            result: { value: state.content ?? state.output ?? "" },
+                        })
+                    } else if (state?.status === "error") {
+                        parts.push({
+                            type: "tool-result",
+                            toolCallID: p.callID,
+                            result: { type: "error", value: state.error ?? "Unknown error" },
+                        })
+                    }
+                    // Tool call part
+                    parts.push({
+                        type: "tool-call",
+                        name: p.name || p.tool || "",
+                        input: state?.input ?? {},
+                        toolCallID: p.callID,
+                    })
+                } else if (p?.type === "tool-call") {
+                    parts.push(p)
+                } else if (p?.type === "tool-result") {
+                    parts.push(p)
+                }
+            }
+        }
+    } else if (role === "system") {
+        // System / compaction messages
+        if (typeof msg.summary === "string" && msg.summary) {
+            parts.push({ type: "text", text: msg.summary })
+        } else if (typeof msg.text === "string" && msg.text) {
+            parts.push({ type: "text", text: msg.text })
+        }
+    }
+
     return {
         info: {
             id,
             role,
-            sessionID: (msg && (msg.sessionID || msgInfo?.sessionID)) || "",
+            sessionID: msg?.sessionID ?? msg?.info?.sessionID ?? "",
             time: { created: Date.now() },
         } as any,
-        parts: (msg && (msg.parts || msg.content)) || [],
+        parts,
     }
 }
 
@@ -198,9 +302,20 @@ export default Plugin.define({
                             return { content: "No messages found in session" }
                         }
 
+                        if (config.debug) {
+                            const first = messages[0] as any
+                            console.log(`[slim] compress: received ${messages.length} messages from session.context()`)
+                            console.log(`[slim] compress: first message type: ${first?.type}, has text: ${typeof first?.text}, has content: ${Array.isArray(first?.content)}`)
+                        }
+
                         const messageWithParts: MessageWithParts[] = messages.map(
                             (m: any) => wrapAsMessageWithParts(m),
                         )
+
+                        if (config.debug) {
+                            const partsCounts = messageWithParts.map((m) => m.parts.length)
+                            console.log(`[slim] compress: parts per message: [${partsCounts.join(", ")}]`)
+                        }
 
                         let targetIndices: number[] = []
                         let inputTokens = 0
@@ -399,6 +514,10 @@ export default Plugin.define({
             const state = getState(sessionId, config)
             state.modelContextLimit = sessionModelLimits.get(sessionId) || initialModelLimit
 
+            if (config.debug) {
+                console.log(`[slim] context hook: session=${sessionId}, messages=${event.messages.length}, modelLimit=${state.modelContextLimit}`)
+            }
+
             // 1) Compression blocks: activate/deactivate and replace ranges.
             const presentIds = new Set<string>()
             for (const msg of event.messages) {
@@ -406,8 +525,13 @@ export default Plugin.define({
                 if (typeof id === "string") presentIds.add(id)
             }
             syncCompressionBlocks(state, presentIds)
+            const beforeCount = event.messages.length
             const filtered = applyCompressedRanges(state, event.messages)
             event.messages.splice(0, event.messages.length, ...filtered)
+
+            if (config.debug && beforeCount !== filtered.length) {
+                console.log(`[slim] compressed ranges: ${beforeCount} -> ${filtered.length} messages`)
+            }
 
             // 2) Pruning strategies (each request).
             pruneInPlace(event.messages, config)
@@ -419,7 +543,7 @@ export default Plugin.define({
             //    to a quick estimate (~4 chars per token).
             let estimatedTokens = 0
             for (const msg of event.messages) {
-                const content = (msg as any)?.content ?? (msg as any)?.parts
+                const content = (msg as any)?.content ?? (msg as any)?.parts ?? []
                 if (Array.isArray(content)) {
                     for (const part of content) {
                         if (part?.type === "text" && part.text) {
@@ -434,24 +558,41 @@ export default Plugin.define({
 
             // 4) DCP limit rules → anchored nudges (max 100k / min 50k by
             //    default, model overrides supported via modelMax/MinLimits).
+            //    Extract provider/model from the last user message for per-model limits.
             const lastUser = findLastUserMessage(event.messages)
             const providerId =
-                lastUser?.model?.providerID ?? lastUser?.model?.id?.split?.("/")[0]
+                lastUser?.model?.providerID ??
+                state._lastProviderId ??
+                (typeof lastUser?.model?.id === "string" ? lastUser.model.id.split("/")[0] : undefined)
             const modelId =
                 lastUser?.model?.modelID ??
-                lastUser?.model?.id?.split?.("/").slice(1).join("/")
+                state._lastModelId ??
+                (typeof lastUser?.model?.id === "string" ? lastUser.model.id.split("/").slice(1).join("/") : undefined)
             const limits = resolveCompressLimits(config, state, providerId, modelId)
-            injectLimitNudges(state, config, event.messages, totalTokens, limits)
+            injectLimitNudges(state, config, event.messages, totalTokens, limits, providerId, modelId)
 
             // 5) Auto-compress: when over the max limit, directly compress old
             //    messages without waiting for the model to call the compress tool.
             //    Registers a compression block so future requests use the summary.
             if (totalTokens > limits.max) {
+                if (config.debug) {
+                    console.log(`[slim] auto-compress triggered: ${totalTokens} > ${limits.max} (max)`)
+                }
                 try {
-                    await autoCompress(state, config, event.messages, totalTokens, limits)
-                } catch {
+                    const result = await autoCompress(state, config, event.messages, totalTokens, limits)
+                    if (config.debug && result.compressed) {
+                        console.log(`[slim] auto-compress: compressed ${result.messageCount} messages, saved ~${result.tokensSaved} tokens`)
+                    }
+                } catch (err) {
+                    if (config.debug) {
+                        console.log(`[slim] auto-compress failed:`, err)
+                    }
                     // Best-effort: auto-compress failure should never break the request.
                 }
+            }
+
+            if (config.debug) {
+                console.log(`[slim] final messages: ${event.messages.length}, tokens: ${totalTokens}, limits: max=${limits.max} min=${limits.min}`)
             }
 
             saveSessionState(state, config.persistence.directory)
@@ -459,7 +600,7 @@ export default Plugin.define({
 
         // ─── Compaction Hook ────────────────────────────────────────────
         // Real, persistent context compression: when OpenCode compacts a session,
-        // summarize the transcript so history actually shrinks (unlike the
+        // provide a structured summary so history actually shrinks (unlike the
         // `context` hook, which only affects the outgoing model request).
         await ctx.session.hook("compaction", async (event) => {
             const sessionId = (event as any).sessionID
@@ -472,18 +613,100 @@ export default Plugin.define({
             const state = getState(sessionId, config)
             state.modelContextLimit = sessionModelLimits.get(sessionId) || initialModelLimit
 
-            const summary = stringifyTranscript(messages)
-            const inputTokens = await countTokens(summary)
+            // Build a structured summary instead of just stringifying.
+            const lines: string[] = []
+            lines.push("## Session Summary (Compacted)")
+            lines.push("")
+
+            const summaryParts: string[] = []
+            const toolCallsSummary: string[] = []
+            const keyDecisions: string[] = []
+            let userMessageCount = 0
+            let assistantMessageCount = 0
+
+            for (const msg of messages) {
+                const type = msg?.type ?? msg?.role ?? ""
+                if (type === "user" || type === "shell" || type === "synthetic") {
+                    userMessageCount++
+                    const text = msg.text ?? ""
+                    if (text.trim().length > 0) {
+                        summaryParts.push(`[User]: ${text.slice(0, 300)}`)
+                    }
+                } else if (type === "assistant") {
+                    assistantMessageCount++
+                    const content = msg.content ?? msg.parts ?? []
+                    if (Array.isArray(content)) {
+                        for (const part of content) {
+                            if (part?.type === "text" && part.text) {
+                                const t = part.text
+                                if (t.length > 0) {
+                                    summaryParts.push(`[Assistant]: ${t.slice(0, 300)}`)
+                                }
+                                // Capture decisions
+                                if (t.includes("decided") || t.includes("implemented") || t.includes("created")) {
+                                    keyDecisions.push(t.slice(0, 200))
+                                }
+                            } else if (part?.type === "tool" || part?.type === "tool-call") {
+                                const name = part.name ?? part.tool ?? "unknown"
+                                toolCallsSummary.push(name)
+                            }
+                        }
+                    }
+                } else if (type === "compaction") {
+                    // Previous compaction summary — include verbatim
+                    if (msg.summary) {
+                        summaryParts.push(`[Previous summary]: ${msg.summary.slice(0, 500)}`)
+                    }
+                }
+            }
+
+            // Compose summary
+            lines.push(`Messages: ${userMessageCount} user, ${assistantMessageCount} assistant`)
+            if (toolCallsSummary.length > 0) {
+                const uniqueTools = [...new Set(toolCallsSummary)]
+                lines.push(`Tools used: ${uniqueTools.join(", ")}`)
+            }
+            lines.push("")
+
+            // Key exchanges (first few and last few, skip middle)
+            const keepFirst = Math.min(3, summaryParts.length)
+            const keepLast = Math.min(3, summaryParts.length)
+            if (keepFirst + keepLast < summaryParts.length) {
+                lines.push("### Key exchanges")
+                for (const s of summaryParts.slice(0, keepFirst)) {
+                    lines.push(s)
+                }
+                lines.push("...")
+                for (const s of summaryParts.slice(-keepLast)) {
+                    lines.push(s)
+                }
+            } else {
+                lines.push("### Conversation")
+                for (const s of summaryParts) {
+                    lines.push(s)
+                }
+            }
+
+            if (keyDecisions.length > 0) {
+                lines.push("")
+                lines.push("### Key decisions")
+                for (const d of keyDecisions.slice(0, 5)) {
+                    lines.push(`- ${d}`)
+                }
+            }
+
+            const summary = lines.join("\n")
+            const inputTokens = await countTokens(messages.map((m: any) => m.text ?? "").join("\n"))
             const outputTokens = await countTokens(summary)
 
-            if (outputTokens > 0 && inputTokens > outputTokens) {
+            if (outputTokens > 0 && inputTokens > 0) {
                 addCompressionRecord(
                     state,
                     {
                         timestamp: Date.now(),
                         inputTokens,
                         outputTokens,
-                        ratio: 1 - outputTokens / inputTokens,
+                        ratio: inputTokens > outputTokens ? 1 - outputTokens / inputTokens : 0,
                         messageCount: messages.length,
                         success: true,
                     },
