@@ -754,3 +754,127 @@ describe("Protected User Messages", () => {
         assert.ok(!withoutProtection.includes("Please refactor the auth module"))
     })
 })
+
+// ─── Multi-Format Message Handling ──────────────────────────────────────────
+
+describe("Multi-Format Message Handling", () => {
+    it("messageHasCompress detects compress in hook format (tool-call)", () => {
+        const msg = {
+            role: "assistant",
+            content: [
+                { type: "text", text: "ok" },
+                { type: "tool-call", name: "compress", input: { focus: "x" } },
+            ],
+        }
+        assert.strictEqual(messageHasCompress(msg), true)
+    })
+
+    it("messageHasCompress detects compress in SessionMessageInfo format (tool)", () => {
+        const msg = {
+            type: "assistant",
+            content: [
+                { type: "text", text: "ok" },
+                { type: "tool", name: "compress", state: { status: "completed", input: {} } },
+            ],
+        }
+        assert.strictEqual(messageHasCompress(msg), true)
+    })
+
+    it("messageHasCompress returns false when no compress call present", () => {
+        const msg = {
+            role: "assistant",
+            content: [
+                { type: "text", text: "ok" },
+                { type: "tool-call", name: "read", input: {} },
+            ],
+        }
+        assert.strictEqual(messageHasCompress(msg), false)
+    })
+
+    it("purgeStaleToolErrors handles SessionMessageInfo tool format", () => {
+        // Need enough messages so the errored tool is "stale" (> turns positions from end)
+        const messages = [
+            {
+                id: "1",
+                type: "assistant",
+                content: [
+                    {
+                        type: "tool",
+                        callID: "c1",
+                        name: "edit",
+                        state: { status: "error", input: { content: "A".repeat(500) }, error: "boom" },
+                    },
+                ],
+            },
+            { id: "2", type: "user", text: "ok" },
+            { id: "3", type: "assistant", content: [{ type: "text", text: "response" }] },
+            { id: "4", type: "user", text: "continue" },
+            {
+                id: "5",
+                type: "assistant",
+                content: [
+                    {
+                        type: "tool",
+                        callID: "c2",
+                        name: "edit",
+                        state: { status: "completed", input: { content: "B".repeat(500) }, content: ["done"] },
+                    },
+                ],
+            },
+            { id: "6", type: "user", text: "recent" },
+        ]
+
+        // turns=2: messages at index <= 6-2-1=3 are eligible for purging
+        purgeStaleToolErrors(messages, 2)
+
+        // c1 (index 0, stale) should be purged
+        assert.ok(messages[0].content[0].state.input.content.startsWith("[input removed"))
+        // c2 (index 4, recent) should be untouched
+        assert.strictEqual(messages[4].content[0].state.input.content, "B".repeat(500))
+    })
+
+    it("applyCompressedRanges handles transcript format messages", () => {
+        const state = makeState()
+        registerCompressionBlock(state, {
+            coveredIds: ["1", "2"],
+            anchorMessageId: "3",
+            summary: "## Summary\nwork done",
+            topic: "work",
+        })
+
+        // Transcript format messages (no 'role', has 'type')
+        const messages = [
+            { id: "1", type: "user", text: "hello" },
+            { id: "2", type: "assistant", content: [{ type: "text", text: "work" }] },
+            { id: "3", type: "user", text: "next" },
+        ]
+
+        syncCompressionBlocks(state, new Set(["1", "2", "3"]))
+        const filtered = applyCompressedRanges(state, messages)
+
+        assert.strictEqual(filtered.length, 2) // summary + "3"
+        assert.strictEqual(filtered[0].type, "user")
+        assert.ok(filtered[0].text.includes("Summary"))
+        assert.ok(!filtered.some((m: any) => m.id === "1" || m.id === "2"))
+    })
+
+    it("resolveModelContextLimit falls back to model.list()", async () => {
+        const mockCtx = {
+            model: {
+                default: () => Promise.resolve(undefined),
+                list: () => [
+                    { providerID: "anthropic", modelID: "claude-sonnet-4-20250514", limit: { context: 200000 } },
+                    { providerID: "openai", modelID: "gpt-4o", limit: { context: 128000 } },
+                ],
+            },
+        }
+        // Since no default is set, it should try list() and find the first model with a limit
+        const limit = await (resolveModelContextLimit as any)(mockCtx)
+        assert.ok(limit > 0)
+    })
+})
+
+// ─── Import for new tests ──────────────────────────────────────────────────
+
+import { messageHasCompress, purgeStaleToolErrors, applyCompressedRanges, syncCompressionBlocks } from "../src/lib/strategies"
+import { resolveModelContextLimit } from "../src/index"
