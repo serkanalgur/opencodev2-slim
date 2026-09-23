@@ -279,7 +279,7 @@ export default Plugin.define({
                     required: ["focus"],
                     additionalProperties: false,
                 },
-                options: { codemode: true },
+                options: { codemode: false },
                 execute: async (input, context) => {
                     const args = input as {
                         focus: string
@@ -425,7 +425,7 @@ export default Plugin.define({
                     properties: {},
                     additionalProperties: false,
                 },
-                options: { codemode: true },
+                options: { codemode: false },
                 execute: async (_input, context) => {
                     const sessionId = context.sessionID
                     const config = getConfig(sessionId)
