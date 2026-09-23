@@ -542,12 +542,16 @@ export default Plugin.define({
             // 3) Token accounting: prefer the server-measured count; fall back
             //    to a quick estimate (~4 chars per token).
             let estimatedTokens = 0
+            let textPartsFound = 0
+            let messagesWithContent = 0
             for (const msg of event.messages) {
                 const content = (msg as any)?.content ?? (msg as any)?.parts ?? []
-                if (Array.isArray(content)) {
+                if (Array.isArray(content) && content.length > 0) {
+                    messagesWithContent++
                     for (const part of content) {
                         if (part?.type === "text" && part.text) {
                             estimatedTokens += Math.ceil(part.text.length / 4)
+                            textPartsFound++
                         }
                     }
                 }
@@ -555,6 +559,10 @@ export default Plugin.define({
             const totalTokens =
                 state.currentTokenCount > 0 ? state.currentTokenCount : estimatedTokens
             state.currentTokenCount = totalTokens
+
+            if (config.debug) {
+                console.log(`[slim] token accounting: messagesWithContent=${messagesWithContent}/${event.messages.length}, textParts=${textPartsFound}, estimatedTokens=${estimatedTokens}, stateTokens=${state.currentTokenCount}, totalTokens=${totalTokens}`)
+            }
 
             // 4) DCP limit rules → anchored nudges (max 100k / min 50k by
             //    default, model overrides supported via modelMax/MinLimits).
@@ -569,7 +577,17 @@ export default Plugin.define({
                 state._lastModelId ??
                 (typeof lastUser?.model?.id === "string" ? lastUser.model.id.split("/").slice(1).join("/") : undefined)
             const limits = resolveCompressLimits(config, state, providerId, modelId)
+
+            if (config.debug) {
+                console.log(`[slim] limits: max=${limits.max} min=${limits.min}, totalTokens=${totalTokens}, overMax=${totalTokens > limits.max}, overMin=${totalTokens >= limits.min}`)
+            }
+
             injectLimitNudges(state, config, event.messages, totalTokens, limits, providerId, modelId)
+
+            if (config.debug) {
+                const nudgeState = state.nudges ?? { contextLimitAnchors: [], turnNudgeAnchors: [], iterationNudgeAnchors: [] }
+                console.log(`[slim] nudges: contextLimit=${nudgeState.contextLimitAnchors.length}, turn=${nudgeState.turnNudgeAnchors.length}, iteration=${nudgeState.iterationNudgeAnchors.length}`)
+            }
 
             // 5) Auto-compress: when over the max limit, directly compress old
             //    messages without waiting for the model to call the compress tool.
