@@ -270,6 +270,16 @@ export default Plugin.define({
                                         description: "What to compress (e.g., 'old exploration')",
                                         required: false,
                                     },
+                                    {
+                                        name: "mode",
+                                        description: "Compression mode: auto, range, or topic",
+                                        required: false,
+                                    },
+                                    {
+                                        name: "keepRecent",
+                                        description: "Number of recent messages to keep (default: 5)",
+                                        required: false,
+                                    },
                                 ],
                             },
                             enabled: true,
@@ -293,18 +303,39 @@ export default Plugin.define({
                                 try {
                                     const args = (input as any) || {}
                                     const focus = args.focus || "user-requested compression"
+                                    const mode = args.mode || "auto"
+                                    const keepRecent = args.keepRecent ?? 5
 
-                                    // Inject a synthetic message asking the assistant to compress.
-                                    const prompt = `Please call the compress tool now with: compress({ focus: "${focus}", mode: "auto" })`
+                                    // Measure current state first
+                                    const real = await measureSession(context, sessionID)
+
+                                    const statusLine = real
+                                        ? `${real.tokens.toLocaleString()} tokens (${real.usagePercent}% of ${real.contextLimit.toLocaleString()})`
+                                        : "unknown"
+
+                                    const text = [
+                                        `**Slim Compress**`,
+                                        ``,
+                                        `**Current state:** ${statusLine}`,
+                                        ``,
+                                        `Ready to compress with:`,
+                                        `- **Focus:** ${focus}`,
+                                        `- **Mode:** ${mode}`,
+                                        `- **Keep recent:** ${keepRecent} messages`,
+                                        ``,
+                                        `> The assistant will now call the compress tool.`,
+                                        `> Or type: \`compress({ focus: "${focus}", mode: "${mode}", keepRecent: ${keepRecent} })\``,
+                                    ].join("\n")
+
                                     await context.client.session.synthetic({
                                         sessionID,
-                                        text: prompt,
+                                        text,
                                         description: "slim-compress",
                                     })
 
                                     context.ui.toast.show({
                                         title: "Slim Compress",
-                                        message: `Compression requested: "${focus}". The assistant will process it on the next turn.`,
+                                        message: `Compression ready: "${focus}". Assistant will process it.`,
                                         variant: "success",
                                         duration: 3000,
                                     })
