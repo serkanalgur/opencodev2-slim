@@ -19,12 +19,12 @@ import {
     autoCompress,
 } from "./lib/strategies"
 import { getSystemPrompt, getCompressToolDescription } from "./lib/prompts"
-import { buildPanelData, renderPanel } from "./lib/tui"
+import { buildPanelData, currentContextTokens, pickModelContextLimit, renderPanel } from "./lib/tui"
 import type { SlimConfig, SessionState, MessageWithParts, CompressionBlock } from "./lib/types"
 
 // ─── State Management ───────────────────────────────────────────────────────
 
-const DEFAULT_MODEL_LIMIT = 200000
+export const DEFAULT_MODEL_LIMIT = 200000
 
 const sessionStates = new Map<string, SessionState>()
 const sessionConfigs = new Map<string, SlimConfig>()
@@ -57,22 +57,15 @@ export async function resolveModelContextLimit(ctx: any): Promise<number> {
         const modelID = defaultRef?.modelID
 
         if (providerID && modelID && typeof ctx.model.list === "function") {
-            const models: Array<{ providerID: string; modelID: string; limit?: { context?: number } }> =
-                ctx.model.list()
-            const found = models.find(
-                (m) => m.providerID === providerID && m.modelID === modelID,
-            )
-            const limit = found?.limit?.context
-            if (typeof limit === "number" && limit > 0) return limit
-        }
-
-        // Fallback: try model.list() for any model with a limit
-        if (typeof ctx.model.list === "function") {
-            const models: Array<{ limit?: { context?: number } }> = ctx.model.list()
-            for (const m of models) {
-                const limit = m.limit?.context
-                if (typeof limit === "number" && limit > 0) return limit
-            }
+            const models: Array<{
+                providerID: string
+                modelID: string
+                limit?: { context?: number }
+            }> = ctx.model.list()
+            // Exact match only — never borrow another model's window. If the
+            // active model is not in the list, fall through to the default.
+            const limit = pickModelContextLimit(models, providerID, modelID)
+            if (limit !== undefined) return limit
         }
     } catch {
         // Fall through to default
@@ -142,7 +135,12 @@ function wrapAsMessageWithParts(msg: any): MessageWithParts {
             role = "user"
         } else if (type === "assistant") {
             role = "assistant"
-        } else if (type === "compaction" || type === "agent" || type === "model" || type === "skill") {
+        } else if (
+            type === "compaction" ||
+            type === "agent" ||
+            type === "model" ||
+            type === "skill"
+        ) {
             role = "system"
         } else {
             role = "assistant"
@@ -250,7 +248,8 @@ export default Plugin.define({
                     properties: {
                         focus: {
                             type: "string",
-                            description: "What to compress (e.g., 'old exploration', 'completed tasks')",
+                            description:
+                                "What to compress (e.g., 'old exploration', 'completed tasks')",
                         },
                         mode: {
                             type: "string",
@@ -304,23 +303,33 @@ export default Plugin.define({
 
                         if (config.debug) {
                             const first = messages[0] as any
-                            console.log(`[slim] compress: received ${messages.length} messages from session.context()`)
-                            console.log(`[slim] compress: first message type: ${first?.type}, has text: ${typeof first?.text}, has content: ${Array.isArray(first?.content)}`)
+                            console.log(
+                                `[slim] compress: received ${messages.length} messages from session.context()`,
+                            )
+                            console.log(
+                                `[slim] compress: first message type: ${first?.type}, has text: ${typeof first?.text}, has content: ${Array.isArray(first?.content)}`,
+                            )
                         }
 
-                        const messageWithParts: MessageWithParts[] = messages.map(
-                            (m: any) => wrapAsMessageWithParts(m),
+                        const messageWithParts: MessageWithParts[] = messages.map((m: any) =>
+                            wrapAsMessageWithParts(m),
                         )
 
                         if (config.debug) {
                             const partsCounts = messageWithParts.map((m) => m.parts.length)
-                            console.log(`[slim] compress: parts per message: [${partsCounts.join(", ")}]`)
+                            console.log(
+                                `[slim] compress: parts per message: [${partsCounts.join(", ")}]`,
+                            )
                         }
 
                         let targetIndices: number[] = []
                         let inputTokens = 0
 
-                        if (mode === "range" && args.start !== undefined && args.end !== undefined) {
+                        if (
+                            mode === "range" &&
+                            args.start !== undefined &&
+                            args.end !== undefined
+                        ) {
                             const start = Math.max(0, args.start)
                             const end = Math.min(messageWithParts.length, args.end)
                             for (let i = start; i < end; i++) {
@@ -432,39 +441,44 @@ export default Plugin.define({
                     const state = getState(sessionId, config)
 
                     try {
-                        // Pull the real, server-measured context usage for this session.
-                        let measured: import("./lib/tui").MeasuredContext | undefined
-                        try {
-                            const info = await ctx.session.get({ sessionID: sessionId })
-                            const tokens = info.tokens as any
-                            const tokenCount =
-                                (tokens?.input ?? 0) +
-                                (tokens?.output ?? 0) +
-                                (tokens?.reasoning ?? 0) +
-                                (tokens?.cache?.read ?? 0) +
-                                (tokens?.cache?.write ?? 0)
-                            measured = {
-                                tokens: tokenCount,
-                                cost: typeof info.cost === "number" ? info.cost : 0,
-                                contextLimit:
-                                    state.modelContextLimit || (await resolveModelContextLimit(ctx)),
-                                model: (info.model && (info.model as any).id) || "unknown",
-                            }
-                            // Keep state's headline figure aligned with reality.
-                            state.modelContextLimit = measured.contextLimit
-                            state.currentTokenCount = measured.tokens
-                        } catch {
-                            // Fall through to estimation if session.get fails.
-                        }
-
                         const messages = await ctx.session.context({ sessionID: sessionId })
 
                         if (!messages || messages.length === 0) {
                             return { content: "No messages found in session" }
                         }
 
-                        const messageWithParts: MessageWithParts[] = messages.map(
-                            (m: any) => wrapAsMessageWithParts(m),
+                        // Measure the current context size from the LAST assistant
+                        // model call (currentContextTokens). Session.Info.tokens is
+                        // lifetime-cumulative — input re-reads the whole context every
+                        // turn and cache.read accumulates per call — so summing it and
+                        // comparing against a context window reports a false "100%
+                        // critical" and feeds the same wrong number to the
+                        // auto-compress threshold. When no per-call tokens are
+                        // available, leave `measured` undefined and fall back to the
+                        // running text estimate instead of storing a bogus value.
+                        let measured: import("./lib/tui").MeasuredContext | undefined
+                        try {
+                            const info = await ctx.session.get({ sessionID: sessionId })
+                            const perCallTokens = currentContextTokens(messages)
+                            if (perCallTokens !== undefined) {
+                                measured = {
+                                    tokens: perCallTokens,
+                                    cost: typeof info.cost === "number" ? info.cost : 0,
+                                    contextLimit:
+                                        state.modelContextLimit ||
+                                        (await resolveModelContextLimit(ctx)),
+                                    model: (info.model && (info.model as any).id) || "unknown",
+                                }
+                                // Keep state's headline figure aligned with reality.
+                                state.modelContextLimit = measured.contextLimit
+                                state.currentTokenCount = measured.tokens
+                            }
+                        } catch {
+                            // Fall through to estimation if session.get fails.
+                        }
+
+                        const messageWithParts: MessageWithParts[] = messages.map((m: any) =>
+                            wrapAsMessageWithParts(m),
                         )
 
                         const panelData = await buildPanelData(
@@ -515,7 +529,9 @@ export default Plugin.define({
             state.modelContextLimit = sessionModelLimits.get(sessionId) || initialModelLimit
 
             if (config.debug) {
-                console.log(`[slim] context hook: session=${sessionId}, messages=${event.messages.length}, modelLimit=${state.modelContextLimit}`)
+                console.log(
+                    `[slim] context hook: session=${sessionId}, messages=${event.messages.length}, modelLimit=${state.modelContextLimit}`,
+                )
             }
 
             // 1) Compression blocks: activate/deactivate and replace ranges.
@@ -530,7 +546,9 @@ export default Plugin.define({
             event.messages.splice(0, event.messages.length, ...filtered)
 
             if (config.debug && beforeCount !== filtered.length) {
-                console.log(`[slim] compressed ranges: ${beforeCount} -> ${filtered.length} messages`)
+                console.log(
+                    `[slim] compressed ranges: ${beforeCount} -> ${filtered.length} messages`,
+                )
             }
 
             // 2) Pruning strategies (each request).
@@ -561,7 +579,9 @@ export default Plugin.define({
             state.currentTokenCount = totalTokens
 
             if (config.debug) {
-                console.log(`[slim] token accounting: messagesWithContent=${messagesWithContent}/${event.messages.length}, textParts=${textPartsFound}, estimatedTokens=${estimatedTokens}, stateTokens=${state.currentTokenCount}, totalTokens=${totalTokens}`)
+                console.log(
+                    `[slim] token accounting: messagesWithContent=${messagesWithContent}/${event.messages.length}, textParts=${textPartsFound}, estimatedTokens=${estimatedTokens}, stateTokens=${state.currentTokenCount}, totalTokens=${totalTokens}`,
+                )
             }
 
             // 4) DCP limit rules → anchored nudges (max 100k / min 50k by
@@ -571,22 +591,42 @@ export default Plugin.define({
             const providerId =
                 lastUser?.model?.providerID ??
                 state._lastProviderId ??
-                (typeof lastUser?.model?.id === "string" ? lastUser.model.id.split("/")[0] : undefined)
+                (typeof lastUser?.model?.id === "string"
+                    ? lastUser.model.id.split("/")[0]
+                    : undefined)
             const modelId =
                 lastUser?.model?.modelID ??
                 state._lastModelId ??
-                (typeof lastUser?.model?.id === "string" ? lastUser.model.id.split("/").slice(1).join("/") : undefined)
+                (typeof lastUser?.model?.id === "string"
+                    ? lastUser.model.id.split("/").slice(1).join("/")
+                    : undefined)
             const limits = resolveCompressLimits(config, state, providerId, modelId)
 
             if (config.debug) {
-                console.log(`[slim] limits: max=${limits.max} min=${limits.min}, totalTokens=${totalTokens}, overMax=${totalTokens > limits.max}, overMin=${totalTokens >= limits.min}`)
+                console.log(
+                    `[slim] limits: max=${limits.max} min=${limits.min}, totalTokens=${totalTokens}, overMax=${totalTokens > limits.max}, overMin=${totalTokens >= limits.min}`,
+                )
             }
 
-            injectLimitNudges(state, config, event.messages, totalTokens, limits, providerId, modelId)
+            injectLimitNudges(
+                state,
+                config,
+                event.messages,
+                totalTokens,
+                limits,
+                providerId,
+                modelId,
+            )
 
             if (config.debug) {
-                const nudgeState = state.nudges ?? { contextLimitAnchors: [], turnNudgeAnchors: [], iterationNudgeAnchors: [] }
-                console.log(`[slim] nudges: contextLimit=${nudgeState.contextLimitAnchors.length}, turn=${nudgeState.turnNudgeAnchors.length}, iteration=${nudgeState.iterationNudgeAnchors.length}`)
+                const nudgeState = state.nudges ?? {
+                    contextLimitAnchors: [],
+                    turnNudgeAnchors: [],
+                    iterationNudgeAnchors: [],
+                }
+                console.log(
+                    `[slim] nudges: contextLimit=${nudgeState.contextLimitAnchors.length}, turn=${nudgeState.turnNudgeAnchors.length}, iteration=${nudgeState.iterationNudgeAnchors.length}`,
+                )
             }
 
             // 5) Auto-compress: when over the max limit, directly compress old
@@ -594,12 +634,22 @@ export default Plugin.define({
             //    Registers a compression block so future requests use the summary.
             if (totalTokens > limits.max) {
                 if (config.debug) {
-                    console.log(`[slim] auto-compress triggered: ${totalTokens} > ${limits.max} (max)`)
+                    console.log(
+                        `[slim] auto-compress triggered: ${totalTokens} > ${limits.max} (max)`,
+                    )
                 }
                 try {
-                    const result = await autoCompress(state, config, event.messages, totalTokens, limits)
+                    const result = await autoCompress(
+                        state,
+                        config,
+                        event.messages,
+                        totalTokens,
+                        limits,
+                    )
                     if (config.debug && result.compressed) {
-                        console.log(`[slim] auto-compress: compressed ${result.messageCount} messages, saved ~${result.tokensSaved} tokens`)
+                        console.log(
+                            `[slim] auto-compress: compressed ${result.messageCount} messages, saved ~${result.tokensSaved} tokens`,
+                        )
                     }
                 } catch (err) {
                     if (config.debug) {
@@ -610,7 +660,9 @@ export default Plugin.define({
             }
 
             if (config.debug) {
-                console.log(`[slim] final messages: ${event.messages.length}, tokens: ${totalTokens}, limits: max=${limits.max} min=${limits.min}`)
+                console.log(
+                    `[slim] final messages: ${event.messages.length}, tokens: ${totalTokens}, limits: max=${limits.max} min=${limits.min}`,
+                )
             }
 
             saveSessionState(state, config.persistence.directory)
@@ -661,7 +713,11 @@ export default Plugin.define({
                                     summaryParts.push(`[Assistant]: ${t.slice(0, 300)}`)
                                 }
                                 // Capture decisions
-                                if (t.includes("decided") || t.includes("implemented") || t.includes("created")) {
+                                if (
+                                    t.includes("decided") ||
+                                    t.includes("implemented") ||
+                                    t.includes("created")
+                                ) {
                                     keyDecisions.push(t.slice(0, 200))
                                 }
                             } else if (part?.type === "tool" || part?.type === "tool-call") {
