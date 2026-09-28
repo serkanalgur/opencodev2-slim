@@ -1,6 +1,11 @@
 import { describe, it } from "node:test"
 import assert from "node:assert"
-import { countTokens, shouldCompress, getMessageText, getToolResultContent } from "../src/lib/compress"
+import {
+    countTokens,
+    shouldCompress,
+    getMessageText,
+    getToolResultContent,
+} from "../src/lib/compress"
 import {
     pruneMessages,
     registerCompressionBlock,
@@ -66,7 +71,12 @@ describe("Message Text Extraction", () => {
 
     it("should extract tool results", () => {
         const msg: MessageWithParts = {
-            info: { id: "1", role: "assistant", sessionID: "s1", time: { created: Date.now() } } as any,
+            info: {
+                id: "1",
+                role: "assistant",
+                sessionID: "s1",
+                time: { created: Date.now() },
+            } as any,
             parts: [
                 {
                     type: "tool",
@@ -86,11 +96,21 @@ describe("Message Pruning", () => {
     it("should apply deduplication", () => {
         const messages: MessageWithParts[] = [
             {
-                info: { id: "1", role: "user", sessionID: "s1", time: { created: Date.now() } } as any,
+                info: {
+                    id: "1",
+                    role: "user",
+                    sessionID: "s1",
+                    time: { created: Date.now() },
+                } as any,
                 parts: [{ type: "text", text: "Hello" } as any],
             },
             {
-                info: { id: "2", role: "user", sessionID: "s1", time: { created: Date.now() } } as any,
+                info: {
+                    id: "2",
+                    role: "user",
+                    sessionID: "s1",
+                    time: { created: Date.now() },
+                } as any,
                 parts: [{ type: "text", text: "Hello" } as any],
             },
         ]
@@ -128,11 +148,21 @@ describe("TUI Panel", () => {
     it("should build panel data with correct message counts", async () => {
         const messages: MessageWithParts[] = [
             {
-                info: { id: "1", role: "user", sessionID: "s1", time: { created: Date.now() } } as any,
+                info: {
+                    id: "1",
+                    role: "user",
+                    sessionID: "s1",
+                    time: { created: Date.now() },
+                } as any,
                 parts: [{ type: "text", text: "Hello" } as any],
             },
             {
-                info: { id: "2", role: "assistant", sessionID: "s1", time: { created: Date.now() } } as any,
+                info: {
+                    id: "2",
+                    role: "assistant",
+                    sessionID: "s1",
+                    time: { created: Date.now() },
+                } as any,
                 parts: [{ type: "text", text: "Hi there!" } as any],
             },
         ]
@@ -182,16 +212,29 @@ describe("TUI Panel", () => {
     it("should assign tool tokens to the tools bucket, not always zero", async () => {
         const messages: MessageWithParts[] = [
             {
-                info: { id: "1", role: "user", sessionID: "s1", time: { created: Date.now() } } as any,
+                info: {
+                    id: "1",
+                    role: "user",
+                    sessionID: "s1",
+                    time: { created: Date.now() },
+                } as any,
                 parts: [{ type: "text", text: "Hello" } as any],
             },
             {
-                info: { id: "2", role: "tool", sessionID: "s1", time: { created: Date.now() } } as any,
+                info: {
+                    id: "2",
+                    role: "tool",
+                    sessionID: "s1",
+                    time: { created: Date.now() },
+                } as any,
                 parts: [
                     {
                         type: "tool",
                         tool: "bash",
-                        state: { type: "result", output: "some long command output that takes tokens" },
+                        state: {
+                            type: "result",
+                            output: "some long command output that takes tokens",
+                        },
                     } as any,
                 ],
             },
@@ -271,7 +314,12 @@ describe("TUI Panel", () => {
     it("should prefer server-measured tokens/cost/limit when provided", async () => {
         const messages: MessageWithParts[] = [
             {
-                info: { id: "1", role: "user", sessionID: "s1", time: { created: Date.now() } } as any,
+                info: {
+                    id: "1",
+                    role: "user",
+                    sessionID: "s1",
+                    time: { created: Date.now() },
+                } as any,
                 parts: [{ type: "text", text: "Hello" } as any],
             },
         ]
@@ -311,19 +359,12 @@ describe("TUI Panel", () => {
         }
 
         // Simulate the server reporting 22% of a 1M-token model, $0.25 spent.
-        const panelData = await buildPanelData(
-            "s1",
-            messages,
-            state,
-            config,
-            "real-model",
-            {
-                tokens: 220326,
-                cost: 0.25,
-                contextLimit: 1000000,
-                model: "real-model",
-            },
-        )
+        const panelData = await buildPanelData("s1", messages, state, config, "real-model", {
+            tokens: 220326,
+            cost: 0.25,
+            contextLimit: 1000000,
+            model: "real-model",
+        })
 
         assert.strictEqual(panelData.currentTokens, 220326)
         assert.ok(Math.abs(panelData.usagePercent - 22.03) < 1, "~22% used (of real model limit)")
@@ -533,11 +574,7 @@ describe("DCP Limit Rules", () => {
 
     it("anchors a context-limit nudge when over the max limit", () => {
         const state = makeState()
-        const messages = [
-            rawMessage("1"),
-            rawMessage("2", "assistant", "work"),
-            rawMessage("3"),
-        ]
+        const messages = [rawMessage("1"), rawMessage("2", "assistant", "work"), rawMessage("3")]
 
         injectLimitNudges(state, makeConfig(), messages, 150000, { max: 100000, min: 50000 })
 
@@ -621,7 +658,11 @@ describe("Pruning Strategies", () => {
                 id: "2",
                 role: "tool",
                 content: [
-                    { type: "tool-result", toolCallID: "c1", result: { type: "error", value: "boom" } },
+                    {
+                        type: "tool-result",
+                        toolCallID: "c1",
+                        result: { type: "error", value: "boom" },
+                    },
                 ],
             },
             { id: "3", role: "user", content: [{ type: "text", text: "ok" }] },
@@ -641,7 +682,11 @@ describe("Pruning Strategies", () => {
                 id: "5",
                 role: "tool",
                 content: [
-                    { type: "tool-result", toolCallID: "c2", result: { type: "error", value: "boom2" } },
+                    {
+                        type: "tool-result",
+                        toolCallID: "c2",
+                        result: { type: "error", value: "boom2" },
+                    },
                 ],
             },
             { id: "6", role: "user", content: [{ type: "text", text: "recent" }] },
@@ -661,11 +706,7 @@ describe("Nudge Idempotency", () => {
     it("does not duplicate a nudge when the usage percentage changes", () => {
         const state = makeState()
         const config = makeConfig()
-        const messages = [
-            rawMessage("1"),
-            rawMessage("2", "assistant", "work"),
-            rawMessage("3"),
-        ]
+        const messages = [rawMessage("1"), rawMessage("2", "assistant", "work"), rawMessage("3")]
         const limits = { max: 100000, min: 50000 }
 
         injectLimitNudges(state, config, messages, 101000, limits) // 101%
@@ -802,7 +843,11 @@ describe("Multi-Format Message Handling", () => {
                         type: "tool",
                         callID: "c1",
                         name: "edit",
-                        state: { status: "error", input: { content: "A".repeat(500) }, error: "boom" },
+                        state: {
+                            status: "error",
+                            input: { content: "A".repeat(500) },
+                            error: "boom",
+                        },
                     },
                 ],
             },
@@ -817,7 +862,11 @@ describe("Multi-Format Message Handling", () => {
                         type: "tool",
                         callID: "c2",
                         name: "edit",
-                        state: { status: "completed", input: { content: "B".repeat(500) }, content: ["done"] },
+                        state: {
+                            status: "completed",
+                            input: { content: "B".repeat(500) },
+                            content: ["done"],
+                        },
                     },
                 ],
             },
@@ -858,23 +907,116 @@ describe("Multi-Format Message Handling", () => {
         assert.ok(!filtered.some((m: any) => m.id === "1" || m.id === "2"))
     })
 
-    it("resolveModelContextLimit falls back to model.list()", async () => {
+    it("resolveModelContextLimit falls back to the default when the exact model is missing", async () => {
         const mockCtx = {
             model: {
-                default: () => Promise.resolve(undefined),
+                default: () => Promise.resolve({ providerID: "acme", modelID: "not-in-list" }),
                 list: () => [
-                    { providerID: "anthropic", modelID: "claude-sonnet-4-20250514", limit: { context: 200000 } },
+                    {
+                        providerID: "anthropic",
+                        modelID: "claude-sonnet-4-20250514",
+                        limit: { context: 200000 },
+                    },
                     { providerID: "openai", modelID: "gpt-4o", limit: { context: 128000 } },
                 ],
             },
         }
-        // Since no default is set, it should try list() and find the first model with a limit
-        const limit = await (resolveModelContextLimit as any)(mockCtx)
-        assert.ok(limit > 0)
+        // The active model is not in the list — the limit must NOT be borrowed
+        // from another provider's model. The old "any model with a limit"
+        // fallback returned 200000 (an unrelated model's window) here.
+        const limit = await resolveModelContextLimit(mockCtx)
+        assert.strictEqual(limit, DEFAULT_MODEL_LIMIT)
+    })
+
+    it("resolveModelContextLimit uses the exact active model's limit", async () => {
+        const mockCtx = {
+            model: {
+                default: () => Promise.resolve({ providerID: "openai", modelID: "gpt-4o" }),
+                list: () => [
+                    {
+                        providerID: "anthropic",
+                        modelID: "claude-sonnet-4-20250514",
+                        limit: { context: 200000 },
+                    },
+                    { providerID: "openai", modelID: "gpt-4o", limit: { context: 128000 } },
+                ],
+            },
+        }
+        const limit = await resolveModelContextLimit(mockCtx)
+        assert.strictEqual(limit, 128000)
+    })
+})
+
+// ─── Context Token Accounting (issue #11) ──────────────────────────────────
+
+describe("currentContextTokens", () => {
+    it("measures the LAST assistant model call, not session lifetime totals", () => {
+        const messages = [
+            // Older assistant call — superseded, must not win
+            {
+                info: {
+                    role: "assistant",
+                    tokens: { input: 100, output: 10, cache: { read: 50 } },
+                },
+            },
+            // A user message carrying inflated session-level figures must never
+            // be picked up — only assistant messages carry per-call usage
+            { info: { role: "user", tokens: { input: 6930479 } } },
+            // Newest assistant call — this IS the current context size
+            {
+                info: {
+                    role: "assistant",
+                    tokens: { input: 5000, output: 800, reasoning: 200, cache: { read: 4200 } },
+                },
+            },
+        ]
+        assert.strictEqual(currentContextTokens(messages), 5000 + 800 + 200 + 4200)
+    })
+
+    it("returns undefined when messages carry no per-call tokens", () => {
+        const messages = [
+            { info: { role: "user", tokens: { input: 999999 } } },
+            { info: { role: "assistant" } },
+            { info: { role: "assistant", tokens: undefined } },
+        ]
+        assert.strictEqual(currentContextTokens(messages), undefined)
+    })
+
+    it("returns undefined for empty or malformed message lists", () => {
+        assert.strictEqual(currentContextTokens([]), undefined)
+        assert.strictEqual(currentContextTokens([{}, undefined, { info: null }]), undefined)
+    })
+})
+
+describe("pickModelContextLimit", () => {
+    it("returns the exact active model's limit", () => {
+        const models = [
+            { providerID: "anthropic", modelID: "claude", limit: { context: 200000 } },
+            { providerID: "openai", modelID: "gpt-4o", limit: { context: 128000 } },
+        ]
+        assert.strictEqual(pickModelContextLimit(models, "openai", "gpt-4o"), 128000)
+    })
+
+    it("returns undefined instead of borrowing another model's limit", () => {
+        const models = [{ providerID: "other", modelID: "big", limit: { context: 1000000 } }]
+        // Regression lock for issue #11: the removed fallback picked the first
+        // model with a limit and reported a window that belongs to nobody.
+        assert.strictEqual(pickModelContextLimit(models, "acme", "missing"), undefined)
+    })
+
+    it("rejects non-positive limits", () => {
+        const models = [{ providerID: "acme", modelID: "m", limit: { context: 0 } }]
+        assert.strictEqual(pickModelContextLimit(models, "acme", "m"), undefined)
     })
 })
 
 // ─── Import for new tests ──────────────────────────────────────────────────
 
-import { messageHasCompress, purgeStaleToolErrors, applyCompressedRanges, syncCompressionBlocks } from "../src/lib/strategies"
-import { resolveModelContextLimit } from "../src/index"
+import {
+    messageHasCompress,
+    purgeStaleToolErrors,
+    applyCompressedRanges,
+    syncCompressionBlocks,
+} from "../src/lib/strategies"
+import { resolveModelContextLimit, DEFAULT_MODEL_LIMIT } from "../src/index"
+import { currentContextTokens, pickModelContextLimit } from "../src/lib/tui"
