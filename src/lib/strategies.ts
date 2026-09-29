@@ -12,20 +12,158 @@ import { addCompressionRecord } from "./state"
 // messages are removed from the outgoing request only — session history is
 // never modified. Newer blocks "consume" older ones (nested compression).
 
+// ─── Stable message keys ───────────────────────────────────────────────────
+//
+// OpenCode v2's `context` hook hands us Prompt.Message objects that carry NO
+// message-level `id` (SessionContext.messages: Array<Message> — BaseMessage is
+// { role, options } plus role-specific content). Anything keyed on `msg.id`
+// therefore resolves to nothing in production, which used to make every block
+// look orphaned. stableMessageKey() gives every message a deterministic,
+// request-after-request reproducible key so blocks can actually be matched.
+
+/**
+ * FNV-1a, 32 bit. Small, dependency-free and fully deterministic: the same
+ * input always yields the same 8-char hex digest on every platform.
+ */
+function fnv1a32(input: string): string {
+    let hash = 0x811c9dc5
+    for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i)
+        hash = Math.imul(hash, 0x01000193)
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0")
+}
+
+/**
+ * Deterministic JSON: object keys are sorted and `undefined`/function/symbol
+ * values are dropped, so two structurally equal messages serialise to byte-
+ * identical strings no matter in which order their properties were assigned.
+ */
+function canonicalJson(value: unknown): string {
+    if (value === null || value === undefined) return "null"
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        // JSON.stringify maps NaN/Infinity to "null", keeping the output total.
+        return JSON.stringify(value)
+    }
+    if (typeof value === "bigint") return JSON.stringify(value.toString())
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
+    if (typeof value === "object") {
+        const entries = Object.entries(value as Record<string, unknown>)
+            .filter(([, v]) => v !== undefined && typeof v !== "function" && typeof v !== "symbol")
+            .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+            .map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`)
+        return `{${entries.join(",")}}`
+    }
+    return "null" // functions / symbols carry no content worth hashing
+}
+
+function firstNonEmptyString(...candidates: unknown[]): string | undefined {
+    for (const candidate of candidates) {
+        if (typeof candidate === "string" && candidate.length > 0) return candidate
+    }
+    return undefined
+}
+
+/**
+ * Produces a stable key for a message.
+ *
+ * Priority:
+ *   1. `msg.id`            → `id:<id>`   (raw Message format)
+ *   2. `msg.info.id`       → `id:<id>`   (transcript / SessionMessageInfo)
+ *   3. otherwise           → `k:<role>:<contentHash>:<index>`
+ *
+ * The fallback embeds the message index so two identical payloads (e.g. the
+ * same tool result repeated) still get distinct keys — a key must identify ONE
+ * message or it is not a key. Pure: depends only on its arguments.
+ */
+export function stableMessageKey(message: unknown, index: number): string {
+    const msg = (message ?? {}) as {
+        id?: unknown
+        role?: unknown
+        content?: unknown
+        parts?: unknown
+        info?: { id?: unknown; role?: unknown }
+    }
+
+    const id = firstNonEmptyString(msg.id, msg.info?.id)
+    if (id !== undefined) return `id:${id}`
+
+    const role = firstNonEmptyString(msg.role, msg.info?.role) ?? "unknown"
+    const content = msg.content ?? msg.parts ?? message
+    return `k:${role}:${fnv1a32(canonicalJson(content))}:${index}`
+}
+
+/**
+ * Keys that occur more than once in a request — ambiguous by definition: two
+ * different messages produced the same key (duplicate id or hash collision).
+ * Such keys must never drive a removal decision ("lock, never guess").
+ */
+export function findAmbiguousKeys(keys: readonly string[]): Set<string> {
+    const counts = new Map<string, number>()
+    for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1)
+
+    const ambiguous = new Set<string>()
+    for (const [key, count] of counts) {
+        if (count > 1) ambiguous.add(key)
+    }
+    return ambiguous
+}
+
+/**
+ * Canonical key space for block references. Request keys from
+ * stableMessageKey() are already prefixed (`id:` / `k:`); raw ids registered by
+ * other paths (the compress tool, persisted legacy blocks) are lifted into the
+ * `id:` space so both worlds resolve to the same message.
+ */
+function canonicalBlockKey(key: string): string {
+    return key.startsWith("id:") || key.startsWith("k:") ? key : `id:${key}`
+}
+
 /**
  * Activates/deactivates blocks based on which messages are present in the
  * current outgoing request. A block is active while both its origin message
  * (compressMessageId) and its anchor message are still present. A newer active
  * block deactivates any older block whose anchor falls inside its covered range.
+ *
+ * References are compared in one canonical key space (see canonicalBlockKey):
+ * `presentIds` carries stable message keys (`id:` / `k:` prefixes) while blocks
+ * registered by the compress tool or loaded from older state carry raw ids —
+ * both must resolve to the same message or a live block would look orphaned
+ * and be dropped.
+ *
+ * `ambiguousIds` (optional) are keys produced by more than one message. A Set
+ * alone cannot reveal that, so the caller passes them when it has them: a block
+ * whose anchor (or origin) resolves ambiguously is never activated, because the
+ * insertion point would be a guess. Such a block is still kept alive by the
+ * orphan filter below (its key IS present in this request — just twice), so
+ * ambiguity costs compression, never data. applyCompressedRanges() enforces the
+ * same lock on its own, so callers without the extra Set stay safe too.
  */
-export function syncCompressionBlocks(state: SessionState, presentIds: Set<string>): void {
+export function syncCompressionBlocks(
+    state: SessionState,
+    presentIds: Set<string>,
+    ambiguousIds?: Set<string>,
+): void {
     const blocks = state.compressionBlocks ?? []
     if (blocks.length === 0) return
 
+    const present = new Set<string>()
+    for (const id of presentIds) present.add(canonicalBlockKey(id))
+    const ambiguous = new Set<string>()
+    for (const id of ambiguousIds ?? []) ambiguous.add(canonicalBlockKey(id))
+
+    const isPresent = (id: string) => present.has(canonicalBlockKey(id))
+    const isAmbiguous = (id: string) => ambiguous.has(canonicalBlockKey(id))
+
     for (const block of blocks) {
         const hasOrigin =
-            block.compressMessageId.length > 0 ? presentIds.has(block.compressMessageId) : true
-        block.active = hasOrigin && presentIds.has(block.anchorMessageId)
+            block.compressMessageId.length > 0
+                ? isPresent(block.compressMessageId) && !isAmbiguous(block.compressMessageId)
+                : true
+        // Safety lock: an ambiguous anchor could point at more than one
+        // message, so the block is not activated this request.
+        block.active =
+            hasOrigin && isPresent(block.anchorMessageId) && !isAmbiguous(block.anchorMessageId)
     }
 
     // Nested consumption: newest active block wins over older blocks it covers,
@@ -37,13 +175,16 @@ export function syncCompressionBlocks(state: SessionState, presentIds: Set<strin
         changed = false
         for (const block of sorted) {
             if (!block.active) continue
+            const blockCoveredKeys = new Set(block.coveredMessageIds.map(canonicalBlockKey))
             for (const older of sorted) {
                 if (older.blockId >= block.blockId || !older.active) continue
-                if (block.coveredMessageIds.includes(older.anchorMessageId)) {
+                if (blockCoveredKeys.has(canonicalBlockKey(older.anchorMessageId))) {
                     older.active = false
                     for (const id of older.coveredMessageIds) {
-                        if (!block.coveredMessageIds.includes(id)) {
+                        const key = canonicalBlockKey(id)
+                        if (!blockCoveredKeys.has(key)) {
                             block.coveredMessageIds.push(id)
+                            blockCoveredKeys.add(key)
                             changed = true
                         }
                     }
@@ -54,11 +195,15 @@ export function syncCompressionBlocks(state: SessionState, presentIds: Set<strin
 
     // Orphaned blocks: inactive and none of their referenced messages survive
     // (e.g. after OpenCode compaction) — safe to forget, otherwise dead entries
-    // accumulate in persisted state forever.
+    // accumulate in persisted state forever. An ambiguously-keyed message still
+    // IS in this request, so its key is present and the block stays alive until
+    // the ambiguity clears rather than be thrown away with it.
     const alive = blocks.filter((b) => {
         if (b.active) return true
         const refs = [b.anchorMessageId, b.compressMessageId, ...(b.coveredMessageIds ?? [])]
-        return refs.some((id) => typeof id === "string" && presentIds.has(id))
+        return refs.some(
+            (id) => typeof id === "string" && (isPresent(id) || isAmbiguous(id)),
+        )
     })
     if (alive.length !== blocks.length) {
         state.compressionBlocks = alive
@@ -71,24 +216,62 @@ export function syncCompressionBlocks(state: SessionState, presentIds: Set<strin
  * splice it back into the event.
  *
  * Handles both Message[] (hook format) and SessionMessageInfo[] (transcript format).
+ *
+ * `keys` (optional) is the pre-mutation key array produced by
+ * stableMessageKey() over the SAME `messages` array — one key per message.
+ * When it is omitted the legacy `msg.id ?? msg.info?.id` lookup is used
+ * unchanged, so existing callers keep their exact behaviour.
+ *
+ * Safety lock: a key produced by more than one message is ambiguous, and an
+ * ambiguous message is never removed and never used as an injection point; a
+ * block whose anchor cannot be resolved unambiguously is skipped entirely
+ * (its covered messages stay too — no summary, no removal).
  */
-export function applyCompressedRanges(state: SessionState, messages: any[]): any[] {
+export function applyCompressedRanges(
+    state: SessionState,
+    messages: any[],
+    keys?: string[],
+): any[] {
     const blocks = (state.compressionBlocks ?? []).filter((b) => b.active)
     if (blocks.length === 0 || messages.length === 0) return messages
+
+    // A key array that does not line up with the message array cannot be
+    // trusted to identify anything — lock instead of guessing.
+    if (keys !== undefined && keys.length !== messages.length) return messages
+
+    // Effective key per message, canonicalised into the same key space as the
+    // block references so both raw-id and key-based blocks resolve.
+    const canonicalKeys: (string | undefined)[] = messages.map((msg, i) => {
+        if (keys !== undefined) return canonicalBlockKey(keys[i])
+        const id = (msg as any)?.id ?? (msg as any)?.info?.id
+        return typeof id === "string" ? canonicalBlockKey(id) : undefined
+    })
+
+    const ambiguousKeys = findAmbiguousKeys(
+        canonicalKeys.filter((k): k is string => k !== undefined),
+    )
+    const presentKeys = new Set(
+        canonicalKeys.filter((k): k is string => k !== undefined),
+    )
 
     const covered = new Set<string>()
     const byAnchor = new Map<string, CompressionBlock>()
     for (const block of blocks) {
-        for (const id of block.coveredMessageIds) covered.add(id)
-        byAnchor.set(block.anchorMessageId, block)
+        const anchorKey = canonicalBlockKey(block.anchorMessageId)
+        // No resolvable insertion point (missing or ambiguous anchor) → the
+        // summary cannot be placed, so this block contributes nothing this
+        // request: neither the summary nor the removal of its range.
+        if (ambiguousKeys.has(anchorKey) || !presentKeys.has(anchorKey)) continue
+        if (block.summary) byAnchor.set(anchorKey, block)
+        for (const id of block.coveredMessageIds) covered.add(canonicalBlockKey(id))
     }
 
     const result: any[] = []
-    for (const msg of messages) {
-        // Extract ID from various formats
-        const id = (msg && (msg.id ?? msg.info?.id)) as string | undefined
-        if (typeof id === "string") {
-            const block = byAnchor.get(id)
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i]
+        const key = canonicalKeys[i]
+        if (key !== undefined && !ambiguousKeys.has(key)) {
+            const block = byAnchor.get(key)
             if (block && block.summary) {
                 // Detect format: if messages have 'role', it's Message format.
                 // If they have 'type', it's SessionMessageInfo format.
@@ -110,7 +293,7 @@ export function applyCompressedRanges(state: SessionState, messages: any[]): any
                     })
                 }
             }
-            if (covered.has(id)) {
+            if (covered.has(key)) {
                 continue
             }
         }
@@ -142,8 +325,12 @@ export function registerCompressionBlock(
         state.nextBlockId ??
         blocks.reduce((max, b) => Math.max(max, b.blockId), 0) + 1
 
+    // Compare in one canonical key space: stable keys ("id:"/"k:") and raw ids
+    // (legacy blocks, the compress tool) must resolve to the same message, or a
+    // newer block would fail to consume an older one anchored inside its range.
+    const coveredKeys = new Set(opts.coveredIds.map(canonicalBlockKey))
     const consumed = blocks
-        .filter((b) => b.active && opts.coveredIds.includes(b.anchorMessageId))
+        .filter((b) => b.active && coveredKeys.has(canonicalBlockKey(b.anchorMessageId)))
         .map((b) => b.blockId)
 
     const block: CompressionBlock = {
@@ -168,10 +355,14 @@ export function registerCompressionBlock(
         if (target) {
             target.active = false
             // Inherit the consumed block's covered messages so they stay
-            // hidden behind the newer summary (nested compression).
+            // hidden behind the newer summary (nested compression). Dedup in
+            // canonical form so raw ids and stable keys do not both survive.
+            const seen = new Set(block.coveredMessageIds.map(canonicalBlockKey))
             for (const id of target.coveredMessageIds) {
-                if (!block.coveredMessageIds.includes(id)) {
+                const key = canonicalBlockKey(id)
+                if (!seen.has(key)) {
                     block.coveredMessageIds.push(id)
+                    seen.add(key)
                 }
             }
         }
@@ -691,6 +882,11 @@ export function injectLimitNudges(
  * Automatically compresses old messages when context exceeds the max limit.
  * Called from the context hook when overMax is true — no model cooperation needed.
  * Registers a compression block so future requests use the summary instead.
+ *
+ * `keys` (optional) are the per-message stable keys computed on the raw
+ * request BEFORE any mutation (see stableMessageKey). They are what the block
+ * stores as anchorMessageId / coveredMessageIds, which is how a later request
+ * recognises the same messages again — production messages carry no `id`.
  */
 export async function autoCompress(
     state: SessionState,
@@ -698,6 +894,7 @@ export async function autoCompress(
     messages: any[],
     currentTokens: number,
     limits: { max: number; min: number },
+    keys?: string[],
 ): Promise<{ compressed: boolean; messageCount?: number; tokensSaved?: number }> {
     if (config.compress.permission === "deny") return { compressed: false }
     if (state.manualMode) return { compressed: false }
@@ -714,9 +911,29 @@ export async function autoCompress(
     if (lastAssistant && messageHasCompress(lastAssistant)) return { compressed: false }
 
     const keepRecent = Math.max(2, config.compress.keepRecent ?? 5)
-    const messageWithParts: MessageWithParts[] = messages.map((m: any) => ({
+
+    // Message keys drive which messages a block covers, so they MUST be the
+    // caller's pre-mutation keys: prune/purge/nudge rewrite message content
+    // inside the request, and the persisted blocks never see those edits —
+    // keys derived after them would not match on the next request.
+    // Without `keys` we fall back to the legacy message-level ids. A `keys`
+    // array that does not line up with `messages` is unusable, so every key
+    // becomes undefined and the anchor lookup below fails → safe lock.
+    const keysAligned = keys === undefined || keys.length === messages.length
+    const messageKeys: (string | undefined)[] = messages.map((m: any, i: number) => {
+        if (keys !== undefined) return keysAligned ? keys[i] : undefined
+        const legacyId = m?.id ?? m?.info?.id
+        return typeof legacyId === "string" && legacyId.length > 0 ? legacyId : undefined
+    })
+    // Ambiguous key (two messages, one key) → never let it cover or anchor
+    // anything: the wrong message must not be closed on a guess.
+    const ambiguousKeys = findAmbiguousKeys(
+        messageKeys.filter((k): k is string => k !== undefined),
+    )
+
+    const messageWithParts: MessageWithParts[] = messages.map((m: any, i: number) => ({
         info: {
-            id: m?.id ?? m?.info?.id ?? "",
+            id: messageKeys[i] ?? "",
             role: m?.role ?? m?.info?.role ?? "user",
             sessionID: m?.sessionID ?? m?.info?.sessionID ?? "",
             time: { created: Date.now() },
@@ -764,15 +981,20 @@ export async function autoCompress(
         return { compressed: false }
     }
 
-    const anchorId = messageWithParts[anchorIndex].info?.id
-    if (!anchorId) {
+    const anchorId = messageKeys[anchorIndex]
+    // No resolvable (or ambiguous) anchor → no safe insertion point for the
+    // summary. Lock: register nothing rather than cover the wrong message.
+    if (!anchorId || ambiguousKeys.has(anchorId)) {
         ;(state as any).lastAutoCompressTime = now
         return { compressed: false }
     }
 
     const coveredIds = [...coveredIndices]
-        .map((i) => messageWithParts[i].info?.id)
-        .filter((id): id is string => typeof id === "string" && id.length > 0)
+        .map((i) => messageKeys[i])
+        .filter(
+            (id): id is string =>
+                typeof id === "string" && id.length > 0 && !ambiguousKeys.has(id),
+        )
     if (coveredIds.length === 0) {
         ;(state as any).lastAutoCompressTime = now
         return { compressed: false }

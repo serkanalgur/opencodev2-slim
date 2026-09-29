@@ -15,6 +15,8 @@ Smart context management plugin for OpenCode v2. Optimizes token usage through s
 - **Session Persistence** - Saves state across restarts
 - **Deduplication** - Removes repeated tool calls automatically
 - **Error Purging** - Cleans up failed tool call outputs after configurable turns
+- **Tool-Output Pruning** - Replaces old, large tool-result payloads on the outgoing request (opt-in, off by default)
+- **Measured vs Estimated Tokens** - Merges the server's real usage with a full-prompt estimate, and labels which one the panel is showing
 - **Topic Extraction** - Identifies and tracks conversation topics
 - **Smart Recommendations** - Provides actionable suggestions for context optimization
 
@@ -42,17 +44,45 @@ If the CLI command doesn't work, add to your `~/.config/opencode/opencode.json`:
 
 After installation, these slash commands are available in the TUI:
 
-- `/panel` — Opens the rich TUI panel with context usage, stats, and help
-- `/compress` — Shows instructions for using the compress tool
+- `/panel` — Context window panel in a dialog: message/token breakdown for the
+  active context, the resolved compression trigger, and live measurements
+- `/compress` — Sends the assistant a compression instruction (see below)
+- `/status` — One-line context health report (tokens / limit / %, model, cost)
+- `/slim-debug` — Toggles `debug` in `~/.config/opencode/slim.jsonc`
+
+`/panel`, `/status` and `/slim-debug` are display-only: they render through
+`context.ui.dialog.alert` and never append anything to the session transcript.
+`/compress` is the exception — it is a deliberate instruction to the model.
 
 ### TUI Panel
 
-The panel provides a real-time overview of your context usage, including:
-- Token usage vs model limit with visual progress bar
-- Message breakdown by role (user/assistant/tools)
-- Compression history and savings
-- Cost estimation based on your model
-- Smart recommendations for optimization
+`/panel` prints:
+
+- Session id and the scope of the numbers — they come from
+  `session.context`, i.e. **messages since the last compaction**, not session
+  totals. The panel states this on a `Scope:` line.
+- Message breakdown by role (user/assistant/system), tool calls, and
+  compactions within that scope
+- Estimated tokens per role plus a total estimate
+- The resolved compression trigger as a token count and as a percentage of the
+  context window (`Trigger: … tokens (…% of … window) · floor …`) — the same
+  line the `panel` tool prints
+- Live measurements: tokens, usage %, status, cost, model
+
+### `panel` tool
+
+The `panel` tool prints a richer, boxed report. Two lines make the numbers
+self-explanatory:
+
+- `Source: measured (server-reported)` / `Source: estimated (approximate)` —
+  where the headline `Context` token figure came from (see
+  [Measurement trust](#measurement-trust-usage)). An estimate is a magnitude,
+  not an exact count.
+- `Prune: N outputs · ~X chars (~Y tokens) saved on last request` — tool-output
+  pruning activity from the most recent request. It is a *per-request* figure
+  (the plan is re-applied every request), not a cumulative saving, and the line
+  appears only when pruning is enabled or the last request actually pruned
+  something.
 
 ### Compress Tool
 
@@ -69,6 +99,24 @@ compress({ focus: "completed tasks", mode: "range", start: 0, end: 50 })
 compress({ focus: "database work", mode: "topic", topic: "database" })
 ```
 
+#### `/compress` delivery
+
+`/compress` does not compress anything itself — it writes a short instruction
+(the focus/mode/keep-recent you passed) into the transcript so the assistant
+calls the `compress` tool. Because the point is to make the model act *now*,
+the synthetic message is sent with an explicit `delivery: "steer"`:
+
+- **`steer` (chosen)** — delivered immediately: it interrupts an in-flight turn,
+  and `session.synthetic` wakes an idle session (`resume` stays at its default
+  `true`). This matches both the server default (`delivery ?? "steer"`) and the
+  TUI's own default prompt delivery, so `/compress` behaves like typing a
+  message.
+- **`queue` (rejected)** — a queued item is only taken when the runner is not
+  already consuming a turn, so the instruction would wait for the next user
+  turn instead of compressing now.
+
+`/panel`, `/status` and `/slim-debug` write nothing to the session.
+
 ## Configuration
 
 Create `~/.config/opencode/slim.jsonc`:
@@ -79,6 +127,8 @@ Create `~/.config/opencode/slim.jsonc`:
     "compress": {
         "enabled": true,
         "permission": "allow",
+        // Absolute token count (e.g. 200000) or percent of the model context
+        // window ("80%"). Broken values fall back to the default, never 0.
         "maxContextLimit": "80%",
         "minContextLimit": "40%",
         "nudgeFrequency": 5,
@@ -94,7 +144,25 @@ Create `~/.config/opencode/slim.jsonc`:
             "enabled": true,
             "turns": 4,
             "protectedTools": []
+        },
+        // OFF by default. When enabled, replaces the payload of old, large,
+        // non-protected tool results on the outgoing request only.
+        "pruneOutputs": {
+            "enabled": false,
+            "minChars": 2000,
+            "maxPerRequest": 50,
+            "protectedTools": []
+        },
+        // Never prune a tool result produced within the last `turns` turns.
+        "turnProtection": {
+            "enabled": true,
+            "turns": 4
         }
+    },
+    // Measured-vs-estimated token accounting (see "Measurement trust" below).
+    "usage": {
+        "trustRatio": 0.5,
+        "capRatio": 3
     },
     "adaptive": {
         "enabled": true,
@@ -111,6 +179,118 @@ Create `~/.config/opencode/slim.jsonc`:
     }
 }
 ```
+
+### Context thresholds
+
+`compress.maxContextLimit` and `compress.minContextLimit` (and their per-model
+overrides `compress.modelMaxLimits` / `compress.modelMinLimits`, keyed
+`"providerId/modelId"`) accept two forms:
+
+| Form | Example | Meaning |
+| --- | --- | --- |
+| Number | `200000` | Absolute token count — triggers once the session reaches 200k tokens. |
+| Percent string | `"80%"` | Percentage of the model's context window (80% of 200k = 160k tokens). |
+
+Percent strings accept a decimal comma for locale-typed configs: if the plain
+parse fails, every comma is retried as the decimal separator, so `"80,5%"`
+means 80.5% of the window (write absolute counts as JSON numbers — thousands
+separators are not supported). A value that still cannot be parsed falls back
+to the built-in default with a console warning, deduplicated per
+(config key, issue, offending value) — repairing a value and breaking the key
+again with a *different* bad value warns again.
+
+Values that cannot be used (unparsable, negative, or a percent while the model
+window is unknown) fall back to the built-in default (`100000` / `50000`) with a
+one-time console warning — never to `0`, which would disable triggering. An
+absolute threshold above the context window is clamped to that window so it can
+still fire. Both panel surfaces — the `panel` tool and the TUI `/panel` dialog —
+show the resolved trigger as a token count and as its percentage of the window
+(`Trigger: … tokens (…% of … window) · floor …`), with the percentage omitted
+when the window is unknown.
+
+**What the threshold is actually compared against.** `maxContextLimit` /
+`minContextLimit` are compared against the size of the **outgoing prompt we are
+about to send** — the real measured usage of the last completed request when the
+provider reported one, otherwise a full-prompt estimate (system prompt, tool
+schemas, message text, tool-call inputs and tool results). They are **never**
+compared against the session's lifetime cumulative token counter, which grows
+without bound because `cache.read` re-reads the whole context every turn. The
+`panel` reflects this split explicitly:
+
+- `Context: … tokens` (the bar) is the **current prompt size** — the figure the
+  threshold applies to.
+- `Lifetime: … tokens · cumulative spend, NOT context size` is the separate
+  lifetime total (`Session.Info.tokens`), shown only when it differs from the
+  prompt size. It is a cost statistic, not occupancy.
+
+The `Context` figure also carries a `Source:` line naming where it came from —
+see [Measurement trust](#measurement-trust-usage) below.
+
+### Tool-output pruning and turn protection
+
+`strategies.pruneOutputs` replaces the *payload* of old, large, non-protected
+tool results (e.g. a huge `read`, `grep` or `bash` output) with a short
+placeholder **on the outgoing request only** — session history is never touched.
+It is **OFF by default** (`enabled: false`): pruning rewrites an earlier part of
+the prompt and therefore invalidates the provider's prefix cache, so it costs a
+one-time full-price request per newly pruned turn.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `pruneOutputs.enabled` | `false` | Master switch. Opt-in; an absent block leaves the prompt untouched. |
+| `pruneOutputs.minChars` | `2000` | Minimum serialized size (characters) for an output to be eligible. |
+| `pruneOutputs.maxPerRequest` | `50` | At most this many outputs pruned per request. Never splits a turn. |
+| `pruneOutputs.protectedTools` | `[]` | Extra tool names kept, on top of the always-protected set (`task`, `skill`, `todowrite`, `todoread`, `write`, `edit`, …). `purgeErrors.protectedTools` is honoured here too. |
+| `turnProtection.enabled` | `true` | Keep the most recent turns intact. |
+| `turnProtection.turns` | `4` | Number of recent turns never pruned — the working set the model is actively using. |
+
+Because the prune plan is rebuilt and re-applied on **every** request, any
+saving it produces is a *per-request* figure, not a cumulative or permanent one.
+The `panel` tool states this on its `Prune:` line (`… saved on last request`) and
+shows it only when pruning is enabled or the last request actually pruned
+something; with the default (off) the line is absent.
+
+### Measurement trust (`usage`)
+
+The trigger merges two independent numbers:
+
+- **measured** — what the provider actually reported for the last completed
+  request (`session.step.ended`: `input + output + reasoning + cache.read +
+  cache.write`). Exact for that request, but it describes the *previous* prompt,
+  so it goes stale the moment pruning/compression shrinks the next one.
+- **estimated** — a character-count approximation of everything on the wire for
+  *this* request (system prompt, tool schemas, text, reasoning, tool-call inputs,
+  tool results, compaction summaries), divided once by ~4 chars/token. No
+  tokenizer is invoked, so it is a magnitude, not an exact count.
+
+Neither is safe alone, so the two are clamped in both directions:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `usage.trustRatio` | `0.5` | A measurement below this fraction of the estimate is treated as stale and the **estimate** wins. |
+| `usage.capRatio` | `3` | A measurement above this multiple of the estimate is treated as a broken reading and **capped** at `capRatio × estimated`. |
+
+Both fields are optional and fall back to the defaults, so an absent block is
+safe. The `panel`'s `Source:` line reports where the panel's **own headline
+figure** came from — `measured (server-reported)` when the server reported usage
+for that request, otherwise `estimated (approximate)` — so an approximation is
+never mistaken for an exact count. It does **not** replay the merge above: the
+trigger applies its own `trustRatio`/`capRatio` rules to the measured *total*
+(`input + output + reasoning + cache.read + cache.write`) against the
+outgoing-prompt estimate, a different quantity from the panel's `Context` figure.
+The panel's `Context:` line is the last request's prompt size
+(`input + cache.read + cache.write`) and its `Lifetime:` line is the session's
+cumulative spend; the two are never mixed, and `Source:` labels only the
+`Context` figure.
+
+Global limits are only resolved when they are actually needed: a model with a
+valid `compress.modelMaxLimits` / `compress.modelMinLimits` override never
+reads — and never warns about — the global `maxContextLimit` /
+`minContextLimit`. The fallback chain itself is unchanged and covered by the
+test suite: a broken per-model override degrades to the *configured* global
+(not straight to the built-in default), a broken global degrades to the
+built-in default, and warnings fire once per (key, issue, value) across
+repeated calls.
 
 ## How It Works
 
@@ -134,12 +314,88 @@ State is saved to disk, so compression history and learning persist across resta
 
 | Command | Description |
 |---------|-------------|
-| `/panel` | Open the Slim TUI panel with context usage, stats, and help |
-| `/compress` | Show instructions for using the compress tool |
+| `/panel` | Open the Slim TUI panel in a dialog with context usage, stats, and trigger thresholds |
+| `/compress` | Send the assistant a compression instruction (`delivery: "steer"`) |
+| `/status` | Show a one-line context health report in a dialog (never written to the session) |
+| `/slim-debug` | Toggle `debug` in `~/.config/opencode/slim.jsonc` and show the result in a dialog |
 
-Note: Compression is performed by the AI assistant using the `compress` tool. The slash command provides guidance on usage.
+Note: Compression is performed by the AI assistant using the `compress` tool. The slash command provides guidance on usage; it is the only slash command that writes to the session, and it does so with an explicit `delivery: "steer"` (see [Compress Tool](#compress-tool)).
 
 ## Changelog
+
+### 3.0.0
+
+**BREAKING CHANGES**
+
+- The compression trigger threshold is now compared against the outgoing
+  prompt's measurement/estimate. The old `Session.Info.tokens` lifetime
+  cumulative cost counter is no longer used to decide the trigger, so existing
+  config files with tuned `maxContextLimit`/`minContextLimit` can behave
+  differently and may need re-tuning. In the panel, `Context:` is the last
+  request's prompt size (`input + cache.read + cache.write`) and `Lifetime:` is
+  the session's cumulative spend; the two are shown separately. When the
+  transcript carries no per-turn usage the old figure is still shown, explicitly
+  labelled as lifetime cumulative.
+- `/panel`, `/status` and `/slim-debug` no longer write to the session (no
+  transcript message); their output is shown in a modal dialog
+  (`context.ui.dialog.alert`). Previous versions wrote the output into the
+  message stream. Only `/compress` still writes (it is an instruction to the
+  model) and now passes an explicit `delivery: "steer"` instead of relying on
+  the server default.
+
+**FIXES**
+
+- Session corruption: removed v1 API remnants (`client.session.synthetic`,
+  `data.session.message.*`) and migrated to the OpenCode v2 API.
+- Compression blocks did not work in production: in the v2 context hook,
+  messages have no `id` field, so the old code always found an empty id and
+  deleted every block. Now uses deterministic content-based key generation plus
+  an ambiguity lock.
+- The token metric only counted text parts (tool input/output, system prompt,
+  tool schemas and reasoning were not counted), so auto-compress effectively
+  never triggered. Now uses the real API measurement (`session.step.ended`) plus
+  a full-prompt-scoped estimate.
+- In v2 a tool result is an array of content blocks, not a string; `String()`
+  produced `[object Object]`.
+- The panel threw `RangeError` when above 100% (negative repeat on a full bar).
+- An invalid threshold value silently fell back to 0, so the trigger never
+  fired. It now falls back to the default and emits a warning.
+- Context-window resolution: the model list was called without `await`, so it
+  always fell back to 200000.
+- Decimal comma support (`80,5%`).
+
+**NEW**
+
+- `maxContextLimit`/`minContextLimit` accept absolute token counts (a bare
+  number); percentage forms (`80%`, `80,5%`) keep working.
+- `strategies.pruneOutputs` prunes tool output (default OFF, opt-in) with turn
+  protection. Auto-compress keys are captured **before** pruning replaces pruned
+  messages with clones, so pruning no longer desynchronises the persisted
+  compression block's anchors from the messages it covered (which left the block
+  inert and re-triggered every throttle window).
+- `usage.trustRatio` / `usage.capRatio` measurement-trust settings.
+- State reset after compaction (`compressionBlocks`, nudge anchors, token
+  measurement).
+- The panel shows a `Source: measured/estimated` line and prune statistics. The
+  `Source:` line describes where the headline figure came from —
+  `measured (server-reported)` when the server reported usage, otherwise
+  `estimated (approximate)` — so an approximation is never read as an exact
+  count. The `Prune:` line reports outputs pruned and characters/tokens saved on
+  the last request (a per-request figure, since pruning is re-applied every
+  request; the line is absent while the default-off feature has not pruned
+  anything).
+- `/panel` states its scope: the stats come from `session.context` ("all
+  messages after the last compaction"), so `Messages:`/`Tokens (est)` are window
+  counts, not session totals, and it now shows the resolved compression trigger
+  (`Trigger: … tokens (…% of … window) · floor …`), matching the `panel` tool.
+- `deriveStats` counts unknown message types (`agent-switched`, `model-switched`,
+  `location-switched`, `idle`, …) as `system` instead of `assistant`, keeping
+  `user + assistant + system === total messages`.
+- Documented `strategies.pruneOutputs` (off by default) and
+  `strategies.turnProtection` in the config reference, plus the `usage`
+  measurement-trust ratios (`trustRatio` / `capRatio`), and clarified that
+  `maxContextLimit` is compared against the outgoing prompt estimate/measurement
+  — not the lifetime cumulative counter.
 
 ### 2.0.13
 
