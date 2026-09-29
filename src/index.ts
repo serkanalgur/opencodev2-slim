@@ -946,7 +946,11 @@ export default Plugin.define({
             // 2) Pruning strategies (each request).
             pruneInPlace(event.messages, config)
             if (config.strategies.purgeErrors.enabled) {
-                purgeStaleToolErrors(event.messages, config.strategies.purgeErrors.turns)
+                purgeStaleToolErrors(
+                    event.messages,
+                    config.strategies.purgeErrors.turns,
+                    config.strategies.purgeErrors.protectedTools,
+                )
             }
 
             // 2b) Tool-output pruning (DCP pruneOutputs) — strictly AFTER

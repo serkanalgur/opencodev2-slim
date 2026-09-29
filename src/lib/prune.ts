@@ -140,10 +140,18 @@ function resolvePruneConfig(config: SlimConfig): ResolvedPruneConfig {
 
     const protectedTools = new Set<string>(PRUNE_ALWAYS_PROTECTED)
     for (const tool of prune?.protectedTools ?? []) protectedTools.add(tool)
-    // `strategies.purgeErrors.protectedTools` was a dead key until now. It is
-    // read here so a tool a user protected from errored-input purging is not
-    // silently pruned on its output side either. The prune step is the only
-    // strategy reader we may extend without editing strategies.ts.
+    // `strategies.purgeErrors.protectedTools` is ALSO folded in, so a tool a
+    // user protected from errored-INPUT purging is not silently pruned on its
+    // output side either. The fold is not redundant with the purge honouring
+    // the list itself: the purge only ever rewrites `input` and only for
+    // errored calls, whereas this set gates the size-based output pruning
+    // below — which runs on SUCCESSFUL results too. So this fold does real
+    // work for every non-errored result of a protected tool.
+    //
+    // What it does NOT do: protect an errored result's output. `candidateFromResult`
+    // returns null for `result.type === "error"` before the protected set is
+    // ever consulted, because a failure's output is the only record of what
+    // went wrong. That lock is unconditional and not up for negotiation.
     for (const tool of config?.strategies?.purgeErrors?.protectedTools ?? []) {
         protectedTools.add(tool)
     }

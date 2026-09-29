@@ -973,10 +973,77 @@ export function applyDeduplication(
  * `toolCallID`/`callID`, which do not exist on the v2 hook parts, so this
  * function was inert in production. The `enabled` default was flipped to
  * `false` for that reason — see `SlimConfig.strategies.purgeErrors`.
+ *
+ * `protectedTools` is honoured on BOTH sides of a pair: an errored result
+ * belonging to a protected tool never contributes its call id to
+ * `erroredCallIds`, and the rewrite pass re-checks the name on the part it is
+ * about to rewrite. Skipping only in the rewrite pass would be enough for the
+ * input, but skipping both is what makes the key mean "this tool is never
+ * touched by the purge". The name is read from the PART under examination and
+ * from nowhere else; a name that cannot be determined never skips (see
+ * `purgeToolNameOf` and `isProtected`).
  */
-export function purgeStaleToolErrors(messages: any[], turns: number): void {
+/**
+ * The tool name carried by a single tool part, on either shape.
+ *
+ * The name lives in a DIFFERENT field per shape:
+ *   - v2 `tool-call` / `tool-result`: `name` (required by the
+ *     `@opencode/ai` `ToolCallPart` / `ToolResultPart` schemas), though the
+ *     result side is not relied on — the parts this plugin synthesises
+ *     (src/index.ts) omit it.
+ *   - v1 `type:"tool"`: `tool` (the SDK `ToolPart` field), with `name`
+ *     accepted as a fallback for shapes that use the v2 spelling.
+ *
+ * Same precedence as `getToolName` in compress.ts, and deliberately read from
+ * the PART rather than the message, because a message can carry several tool
+ * parts of different tools. Also read from the part rather than the OTHER side
+ * of its pair: the name is never borrowed across a pairing, because the pass
+ * that examines the result is the same pass that decides whether the pair is
+ * purged at all.
+ *
+ * Returns `undefined` when the part carries no name. Callers must treat that
+ * as "unknown" and must NOT skip on it: the purge is the default behaviour, so
+ * failing open preserves it, while failing closed would silently protect every
+ * nameless tool.
+ */
+function purgeToolNameOf(part: any): string | undefined {
+    for (const key of ["name", "tool"] as const) {
+        const value = part?.[key]
+        if (typeof value === "string" && value.length > 0) return value
+    }
+    return undefined
+}
+
+export function purgeStaleToolErrors(
+    messages: any[],
+    turns: number,
+    protectedTools: string[] = [],
+): void {
     const n = messages.length
     if (n === 0) return
+
+    const protectedSet = new Set(protectedTools)
+
+    /**
+     * Whether THIS part's own tool is on the protected list.
+     *
+     * The name is read from the part, per `purgeToolNameOf` — never from the
+     * other side of the pair. A cross-side lookup is not merely redundant here,
+     * it is unreachable: the collection pass below examines the RESULT part,
+     * and a protected result is never registered in `erroredCallIds`, so the
+     * rewrite pass (the only reader that would need the other side's name) is
+     * never reached for that pair.
+     *
+     * `undefined` — an undeterminable name — must NOT skip. The purge is the
+     * default behaviour, so failing OPEN preserves it; failing closed would
+     * protect every nameless tool, i.e. the user would opt into a purge that
+     * silently does nothing, which is the far more damaging direction.
+     */
+    const isProtected = (part: any): boolean => {
+        if (protectedSet.size === 0) return false
+        const name = purgeToolNameOf(part)
+        return name !== undefined && protectedSet.has(name)
+    }
 
     // Collect errored call IDs from all message formats
     const erroredCallIds = new Set<string>()
@@ -989,13 +1056,15 @@ export function purgeStaleToolErrors(messages: any[], turns: number): void {
             if (part?.type === "tool-result") {
                 if (part.result?.type === "error") {
                     const callId = pairingIdOf(part)
-                    if (callId) erroredCallIds.add(String(callId))
+                    if (callId && !isProtected(part)) {
+                        erroredCallIds.add(String(callId))
+                    }
                 }
             }
             // Format 2: tool with state.status === "error"
             if (part?.type === "tool" && part?.state?.status === "error") {
                 const callId = pairingIdOf(part)
-                if (callId) erroredCallIds.add(String(callId))
+                if (callId && !isProtected(part)) erroredCallIds.add(String(callId))
             }
         }
     }
@@ -1013,6 +1082,12 @@ export function purgeStaleToolErrors(messages: any[], turns: number): void {
             if (part?.type === "tool-call") {
                 const callId = pairingIdOf(part)
                 if (!callId || !erroredCallIds.has(String(callId))) continue
+                // Re-checked here, not only in the collection pass: the two
+                // sides of a pair are different parts and the name is read
+                // per part, so a protected call side must be spared even where
+                // the collection pass matched on a different part's name. A
+                // nameless call is NOT spared (see `isProtected`).
+                if (isProtected(part)) continue
                 const input = part.input
                 if (input && typeof input === "object") {
                     for (const key of Object.keys(input)) {
@@ -1026,6 +1101,7 @@ export function purgeStaleToolErrors(messages: any[], turns: number): void {
             if (part?.type === "tool") {
                 const callId = pairingIdOf(part)
                 if (!callId || !erroredCallIds.has(String(callId))) continue
+                if (isProtected(part)) continue
                 const state = part.state
                 if (state?.input && typeof state.input === "object") {
                     for (const key of Object.keys(state.input)) {

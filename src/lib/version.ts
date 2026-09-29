@@ -12,4 +12,4 @@
  * release bump that forgets this constant fails the suite instead of shipping a
  * stale version string to users.
  */
-export const PLUGIN_VERSION = "3.0.3"
+export const PLUGIN_VERSION = "3.0.4"

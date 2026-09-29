@@ -162,9 +162,11 @@ function resolveThresholds(real?: MeasuredReal | null): ResolvedThresholds {
     return resolveCompressLimits(config, state, providerID, modelID)
 }
 
-// Same line shape as `renderPanel` in src/lib/tui.ts so the TUI slash panel
-// and the `panel` tool report the trigger identically.
-function renderTriggerLine(thresholds: ResolvedThresholds, contextLimit: number): string {
+// Same lines as `renderPanel` in src/lib/tui.ts so the TUI slash panel and the
+// `panel` tool report the trigger identically — threshold and its window on one
+// line, the floor on a continuation line, because the three facts together
+// overrun the 63-column frame at worst-case magnitudes.
+function renderTriggerLines(thresholds: ResolvedThresholds, contextLimit: number): string[] {
     const window =
         contextLimit > 0
             ? `${((thresholds.max / contextLimit) * 100).toFixed(1)}% of ${formatTokens(contextLimit)} window`
@@ -173,7 +175,7 @@ function renderTriggerLine(thresholds: ResolvedThresholds, contextLimit: number)
         contextLimit > 0
             ? `${formatTokens(thresholds.min)} (${((thresholds.min / contextLimit) * 100).toFixed(1)}%)`
             : formatTokens(thresholds.min)
-    return `│ Trigger: ${formatTokens(thresholds.max)} tokens (${window}) · floor ${floor}`
+    return [`│ Trigger: ${formatTokens(thresholds.max)} tokens (${window})`, `│   floor ${floor}`]
 }
 
 // Builds a human-readable panel as plain text. The result is only ever shown
@@ -212,7 +214,7 @@ function renderPanelText(
               ? "warning"
               : "healthy"
     // F5: README promises the resolved threshold (token count + % of window).
-    const trigger = thresholds ? renderTriggerLine(thresholds, limit) : null
+    const trigger = thresholds ? renderTriggerLines(thresholds, limit) : null
     const lines: string[] = []
     lines.push("┌─────────────────────────────────────────────────────────────┐")
     lines.push("│                    SLIM CONTEXT PANEL                       │")
@@ -226,7 +228,7 @@ function renderPanelText(
     lines.push(`│   Tool calls: ${stats.toolCalls}  Compactions in scope: ${stats.compactionCount}`)
     lines.push(`│ Tokens (est): User ${stats.tokensByRole.user} | Assistant ${stats.tokensByRole.assistant} | System ${stats.tokensByRole.system}`)
     lines.push(`│ Total token estimate: ${stats.totalTokens}`)
-    if (trigger && !real) lines.push(trigger)
+    if (trigger && !real) lines.push(...trigger)
     if (real) {
         lines.push("├─────────────────────────────────────────────────────────────┤")
         // Two different quantities, never mixed (mirrors `renderPanel` in
@@ -262,7 +264,7 @@ function renderPanelText(
                 `│ Lifetime: ${formatTokens(real.tokens)} tokens (cumulative spend, fill unknown)`,
             )
         }
-        if (trigger) lines.push(trigger)
+        if (trigger) lines.push(...trigger)
         if (real.cost > 0) lines.push(`│ Cost: $${real.cost.toFixed(6)}`)
         lines.push(`│ Model: ${real.model}`)
     }

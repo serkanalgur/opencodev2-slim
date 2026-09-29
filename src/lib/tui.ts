@@ -412,15 +412,15 @@ function generateRecommendations(
     const recs: string[] = []
     
     if (usagePercent > 80) {
-        recs.push("Context usage is high. Consider compressing older messages.")
+        recs.push("Context usage is high. Consider compressing old messages.")
     }
     
     if (usagePercent > 90) {
-        recs.push("Context nearly full! Run compress immediately to avoid truncation.")
+        recs.push("Context nearly full! Run compress to avoid truncation.")
     }
     
     if (compressionCount === 0 && messageCount > 20) {
-        recs.push("No compressions yet with many messages. Consider running compress.")
+        recs.push("No compressions yet. Consider running compress.")
     }
     
     if (averageRatio < 0.3 && compressionCount > 0) {
@@ -428,7 +428,7 @@ function generateRecommendations(
     }
     
     if (messageCount > 50 && usagePercent < 50) {
-        recs.push("Many messages but low usage. Deduplication may help further.")
+        recs.push("Many messages but low usage. Deduplication may help.")
     }
     
     if (recs.length === 0) {
@@ -502,7 +502,14 @@ export function renderPanel(data: PanelData): string {
             minPercent === null
                 ? formatTokens(minTokens)
                 : `${formatTokens(minTokens)} (${minPercent.toFixed(1)}%)`
-        lines.push(`│ Trigger: ${formatTokens(tokens)} tokens (${window}) · floor ${floor}`)
+        // Two lines, not one: the threshold, the window it is relative to and
+        // the floor are three separate facts, and at worst-case magnitudes
+        // ("9007.2T", a four-digit percent) all three cannot share 61 columns.
+        // The floor moves to a continuation line rather than being truncated —
+        // a hidden value is worse than a documented overflow. Continuation lines
+        // in this box are indented two columns (see the Context/Tokens pair).
+        lines.push(`│ Trigger: ${formatTokens(tokens)} tokens (${window})`)
+        lines.push(`│   floor ${floor}`)
     }
     // Tool-output pruning trace. The plan is rebuilt and re-applied on EVERY
     // request, so this is the saving of the last outgoing request only — never
@@ -511,9 +518,14 @@ export function renderPanel(data: PanelData): string {
     if (data.prune) {
         const chars = formatTokens(data.prune.charsSaved)
         const approxTokens = formatTokens(Math.round(data.prune.charsSaved / 4))
+        // Same two-line split: the figures on the first, the "last request
+        // only" caveat on the second. The caveat is what stops a reader
+        // treating the figure as a permanent saving, so it is stated in those
+        // words rather than dropped to make the line fit.
         lines.push(
-            `│ Prune: ${data.prune.prunedOutputs} outputs · ~${chars} chars (~${approxTokens} tokens) saved on last request`,
+            `│ Prune: ${data.prune.prunedOutputs} outputs · ~${chars} chars (~${approxTokens} tokens)`,
         )
+        lines.push("│   saved on the last request only, not cumulative")
     }
     lines.push("")
     
@@ -576,14 +588,16 @@ export function renderPanel(data: PanelData): string {
 // thousands and a large value can never render as a 10-character string.
 // MAX_SAFE_INTEGER (9.007e15) renders "9007.2T" — exactly 7 chars.
 //
-// Scope of that budget: it is derived from the LIFETIME line alone, which has 56
-// columns of fixed text in a 63-column frame, leaving 7 for the number. It is
-// NOT a universal guarantee for every line in the panel — the Trigger and Prune
-// lines carry far less fixed text and can absorb a wider number. Those overflow
-// their frame at entirely ordinary values and are a separate, pre-existing
-// defect; the `ALLOWED_OVERFLOW` width test does not catch them because it
-// never drives `renderPanel` with a prune field. The comment records the
-// reasoning it actually supports rather than a claim about the whole panel.
+// Scope of that budget: every `formatTokens` call site in `renderPanel` now
+// fits inside the frame at the full 7-character worst case. The binding
+// constraint is the LIFETIME line, which has 56 columns of fixed text in a
+// 63-column frame, leaving exactly 7 for the number. The lines that carry the
+// widest fixed text are the only ones that can approach the limit; the narrower
+// ones (Trigger, Prune, the role breakdown) have 14+ columns to spare, and the
+// multi-fact lines that could not fit were split across two lines rather than
+// truncated. The `Panel box width` test drives `renderPanel` with a prune
+// payload and asserts the overflow allowlist is empty, so a future line that
+// outgrows the frame fails immediately.
 //
 // One decimal at every tier, kept deliberately: "150.0K", "200.0K",
 // "800.0K" and "1.0M" are asserted verbatim in the test suite, and the

@@ -80,9 +80,10 @@ After installation, these slash commands are available in the TUI:
 - Message breakdown by role (user/assistant/system), tool calls, and
   compactions within that scope
 - Estimated tokens per role plus a total estimate
-- The resolved compression trigger as a token count and as a percentage of the
-  context window (`Trigger: … tokens (…% of … window) · floor …`) — the same
-  line the `panel` tool prints
+- The resolved compression trigger, as a token count and as a percentage of the
+  context window, then the floor on a continuation line —
+  `Trigger: … tokens (…% of … window)` followed by `floor …` — the same two
+  lines the `panel` tool prints
 - Live measurements: tokens, usage %, status, cost, model
 
 ### `panel` tool
@@ -94,11 +95,12 @@ self-explanatory:
   where the headline `Context` token figure came from (see
   [Measurement trust](#measurement-trust-usage)). An estimate is a magnitude,
   not an exact count.
-- `Prune: N outputs · ~X chars (~Y tokens) saved on last request` — tool-output
-  pruning activity from the most recent request. It is a *per-request* figure
-  (the plan is re-applied every request), not a cumulative saving, and the line
-  appears only when pruning is enabled or the last request actually pruned
-  something.
+- `Prune: N outputs · ~X chars (~Y tokens)`, with the caveat
+  `saved on the last request only, not cumulative` on a continuation line —
+  tool-output pruning activity from the most recent request. It is a
+  *per-request* figure (the plan is re-applied every request), not a cumulative
+  saving, and the line appears only when pruning is enabled or the last request
+  actually pruned something.
 
 ### Compress Tool
 
@@ -229,8 +231,8 @@ one-time console warning — never to `0`, which would disable triggering. An
 absolute threshold above the context window is clamped to that window so it can
 still fire. Both panel surfaces — the `panel` tool and the TUI `/panel` dialog —
 show the resolved trigger as a token count and as its percentage of the window
-(`Trigger: … tokens (…% of … window) · floor …`), with the percentage omitted
-when the window is unknown.
+(`Trigger: … tokens (…% of … window)`), with the floor on its own continuation
+line (`floor …`), and with the percentage omitted when the window is unknown.
 
 **What the threshold is actually compared against.** `maxContextLimit` /
 `minContextLimit` are compared against the size of the **outgoing prompt we are
@@ -241,8 +243,9 @@ compared against the session's lifetime cumulative token counter, which grows
 without bound because `cache.read` re-reads the whole context every turn. The
 `panel` reflects this split explicitly:
 
-- `Context: … tokens` (the bar) is the **current prompt size** — the figure the
-  threshold applies to.
+- `Context: [█…] …%` (the bar) is the **current prompt size** — the figure the
+  threshold applies to, with its magnitudes on the continuation line
+  `… / … tokens`.
 - `Lifetime: … tokens · cumulative spend, NOT context size` is the separate
   lifetime total (`Session.Info.tokens`), shown only when it differs from the
   prompt size. It is a cost statistic, not occupancy.
@@ -264,15 +267,17 @@ one-time full-price request per newly pruned turn.
 | `pruneOutputs.enabled` | `false` | Master switch. Opt-in; an absent block leaves the prompt untouched. |
 | `pruneOutputs.minChars` | `2000` | Minimum serialized size (characters) for an output to be eligible. |
 | `pruneOutputs.maxPerRequest` | `50` | At most this many outputs pruned per request. Never splits a turn. |
-| `pruneOutputs.protectedTools` | `[]` | Extra tool names kept, on top of the always-protected set (`task`, `skill`, `todowrite`, `todoread`, `write`, `edit`, …). `purgeErrors.protectedTools` is honoured here too. |
+| `pruneOutputs.protectedTools` | `[]` | Extra tool names kept, on top of the always-protected set (`task`, `skill`, `todowrite`, `todoread`, `write`, `edit`, …). `purgeErrors.protectedTools` is folded into this set too. It says nothing about errored results: those are never pruned, whatever the list says. |
 | `turnProtection.enabled` | `true` | Keep the most recent turns intact. |
 | `turnProtection.turns` | `4` | Number of recent turns never pruned — the working set the model is actively using. |
 
 Because the prune plan is rebuilt and re-applied on **every** request, any
 saving it produces is a *per-request* figure, not a cumulative or permanent one.
-The `panel` tool states this on its `Prune:` line (`… saved on last request`) and
-shows it only when pruning is enabled or the last request actually pruned
-something; with the default (off) the line is absent.
+The `panel` tool states this on its `Prune:` block
+(`Prune: … outputs · … chars (… tokens)` followed by
+`… saved on the last request only, not cumulative`) and shows it only when
+pruning is enabled or the last request actually pruned something; with the
+default (off) the block is absent.
 
 ### Purge-errors migration
 
@@ -303,11 +308,21 @@ The purge and the [Tool-pair guard](#tool-pair-guard) both act on
 `event.messages` in the same context hook, so enabling one does not leave the
 other passive: whatever the guard is protecting, the purge is rewriting.
 
+`purgeErrors.protectedTools` is the escape hatch for that. A tool named there is
+skipped on both sides of a pair: its errored result never registers the call as
+a purge candidate, and the rewrite pass re-checks the name before touching the
+`input`. Because the two sides can carry the name differently, the name is read
+per part — `name` on the v2 `tool-call` / `tool-result` parts, `tool` on the v1
+`{ type: "tool" }` part — and falls back to the other side of the pair. If
+neither side carries a name, the tool is **not** protected: an unknown name is
+not in your list, and silently sparing every nameless tool would make the purge
+appear to do nothing.
+
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `purgeErrors.enabled` | `false` | Master switch. Opt-in after 3.0.2. |
 | `purgeErrors.turns` | `4` | A call is only purged once it is at least this many messages from the end. |
-| `purgeErrors.protectedTools` | `[]` | Tool names exempt from the purge. Also honoured by `pruneOutputs.protectedTools`. |
+| `purgeErrors.protectedTools` | `[]` | Tool names exempt from the purge: an errored call to one of these keeps its `input` verbatim. Only the **input** is spared — the error message itself is never rewritten, and an errored result's output is never pruned by anything. The list is also folded into `pruneOutputs.protectedTools`, so it additionally protects that tool's *successful* outputs from size-based pruning. A tool whose name cannot be read from either side of a pair is **not** protected. |
 
 ### Tool-pair guard
 
@@ -412,6 +427,41 @@ State is saved to disk, so compression history and learning persist across resta
 Note: Compression is performed by the AI assistant using the `compress` tool. The slash command provides guidance on usage; it is the only slash command that writes to the session, and it does so with an explicit `delivery: "steer"` (see [Compress Tool](#compress-tool)).
 
 ## Changelog
+
+### 3.0.4
+
+**FIXES**
+
+- `strategies.purgeErrors.protectedTools` now protects the tool's input. The
+  option was documented but never consulted on the input side, so a tool named
+  there still had the input of its failed call rewritten. It is honoured now, on
+  every message shape. Note that the list is also folded into output pruning, so
+  naming a tool here exempts it from the errored-input purge *and* from
+  size-based output pruning of its successful results.
+- A tool whose name cannot be determined on a message part is now purged rather
+  than protected, so opting a tool in can never turn into a purge that silently
+  does nothing.
+- Two panel lines no longer overflow the panel frame. The compression-trigger
+  line and the pruning line were each split across two lines so every value fits;
+  nothing was dropped and nothing was truncated. The trigger's floor and the
+  pruning line's "last request only, not cumulative" caveat each moved to a
+  continuation line, and both are still shown.
+
+**NEW**
+
+- Panel overflows from unbounded text are now disclosed rather than hidden. The
+  model id, topic name and recommendation lines are emitted from unbounded
+  server- or user-supplied strings and can exceed the frame at extreme lengths.
+  They are not truncated — that is a deliberate decision deferred to a later
+  change — but the exception is now recorded in the test suite with its reason,
+  so a future change that fixes one of them cannot happen silently.
+
+**DOCS**
+
+- Corrected two panel-output descriptions that did not match what the renderer
+  actually emits. A test now extracts the README's quoted output and checks it
+  against rendered output, so this class of documentation drift fails the build
+  instead of accumulating.
 
 ### 3.0.3
 
@@ -577,7 +627,8 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 - `usage.trustRatio` / `usage.capRatio` measurement-trust settings.
 - State reset after compaction (`compressionBlocks`, nudge anchors, token
   measurement).
-- The panel shows a `Source: measured/estimated` line and prune statistics. The
+- The panel shows a `Source: measured (server-reported)` line (or
+  `Source: estimated (approximate)`) and prune statistics. The
   `Source:` line describes where the headline figure came from —
   `measured (server-reported)` when the server reported usage, otherwise
   `estimated (approximate)` — so an approximation is never read as an exact
@@ -588,7 +639,8 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 - `/panel` states its scope: the stats come from `session.context` ("all
   messages after the last compaction"), so `Messages:`/`Tokens (est)` are window
   counts, not session totals, and it now shows the resolved compression trigger
-  (`Trigger: … tokens (…% of … window) · floor …`), matching the `panel` tool.
+  over two lines (`Trigger: … tokens (…% of … window)` then `floor …`),
+  matching the `panel` tool.
 - `deriveStats` counts unknown message types (`agent-switched`, `model-switched`,
   `location-switched`, `idle`, …) as `system` instead of `assistant`, keeping
   `user + assistant + system === total messages`.

@@ -72,6 +72,19 @@ export interface SlimConfig {
         purgeErrors: {
             enabled: boolean
             turns: number
+            /**
+             * Tool names exempt from the purge: an errored call to one of these
+             * keeps its input verbatim, and it is never registered as an errored
+             * call in the first place. Default: [].
+             *
+             * Only the INPUT is spared. The error message itself is never
+             * rewritten by any strategy, and the tool's OUTPUT is not covered
+             * by this key either — errored results are excluded from
+             * `pruneOutputs` unconditionally, so this list changes nothing
+             * there. Naming a tool here also protects its output from
+             * `pruneOutputs`, which is a separate, size-gated effect (see
+             * `pruneOutputs.protectedTools`, which this list is folded into).
+             */
             protectedTools: string[]
         }
         /**
@@ -106,7 +119,11 @@ export interface SlimConfig {
             maxPerRequest?: number
             /**
              * Tool names kept in addition to the always-protected set. Default: [].
-             * `purgeErrors.protectedTools` is honoured here as well.
+             * The `purgeErrors.protectedTools` list is folded into this set too,
+             * so naming a tool in EITHER list protects it from output pruning.
+             * Note this set is not consulted for errored results: a failed
+             * tool's output is never pruned, because the record of what went
+             * wrong is the one thing the error message must keep.
              */
             protectedTools?: string[]
         }
