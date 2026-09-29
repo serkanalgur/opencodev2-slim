@@ -173,7 +173,11 @@ Create `~/.config/opencode/slim.jsonc`:
         "turnProtection": {
             "enabled": true,
             "turns": 4
-        }
+        },
+        // ON by default, escape hatch only. Set to false only if you have a
+        // reason to: it lets a range split a tool pair again, and the provider
+        // will reject the next request with `invalid_request_error`.
+        "guardToolPairs": true
     },
     // Measured-vs-estimated token accounting (see "Measurement trust" below).
     "usage": {
@@ -266,6 +270,31 @@ The `panel` tool states this on its `Prune:` line (`… saved on last request`) 
 shows it only when pruning is enabled or the last request actually pruned
 something; with the default (off) the line is absent.
 
+### Tool-pair guard
+
+Compression blocks and deduplication both drop *whole* messages, which can
+split a tool call from its result. The host repairs one direction of that split
+(it synthesises `Tool result missing` for a surviving call) but not the other: a
+surviving `role:"tool"` result whose call is gone is emitted with an orphan
+`tool_call_id` and the next request fails with `[invalid_request_error] invalid
+request`.
+
+`strategies.guardToolPairs` therefore forbids removing a `tool-call` whose
+`tool-result` is not removed by the same pass. It is **ON by default**; set it
+to `false` only as an escape hatch, because turning it off on a range that
+splits a pair restores the 400. A block whose covered range ends up entirely
+locked by the guard is skipped altogether rather than injecting a summary with
+no removal behind it.
+
+The summary itself is injected as a `role:"user"` message wrapped in a
+`<conversation-checkpoint>` envelope, so the model can see where the replaced
+range began and ended. The tags are part of what your model reads on every
+compressed turn — mention them if you need to.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `guardToolPairs` | `true` | ON by default, escape hatch only. Never remove a message carrying a `tool-call` whose `tool-result` survives. Applies to compression blocks and deduplication; anything other than an explicit `false` counts as on. |
+
 ### Measurement trust (`usage`)
 
 The trigger merges two independent numbers:
@@ -338,6 +367,44 @@ State is saved to disk, so compression history and learning persist across resta
 Note: Compression is performed by the AI assistant using the `compress` tool. The slash command provides guidance on usage; it is the only slash command that writes to the session, and it does so with an explicit `delivery: "steer"` (see [Compress Tool](#compress-tool)).
 
 ## Changelog
+
+### 3.0.2
+
+**FIXES**
+
+- A compressed message range could leave a tool result behind without the tool
+  call that produced it, and the next model request was rejected with
+  `[invalid_request_error] invalid request`. The covered range was selected on
+  token size, and a message carrying only tool calls counts as zero text tokens —
+  so such a message fell outside the range while its (large) tool result fell
+  inside it, leaving an orphaned `tool_call_id` on the wire. This affected the
+  `compress` tool and automatic compression alike.
+- Compression no longer breaks a tool call/result pair. The rule is
+  one-directional: a tool call may only be removed when every tool result
+  carrying the same id is removed by the same pass. A surviving call whose result
+  is missing is repaired by the host, but a surviving result whose call is
+  missing is not. A block whose covered range ends up removing nothing is
+  skipped entirely rather than injecting its summary, so compression can never
+  grow the prompt.
+- The same protection now applies to output deduplication, which could orphan a
+  tool pair the same way.
+- Sessions compressed by an earlier version are repaired automatically. The
+  protection is applied when the request is built, so a block registered before
+  the fix that covers a broken range is corrected on the next request — no state
+  reset and no manual intervention.
+- The injected summary is now wrapped in a `<conversation-checkpoint>` envelope,
+  so the model can see where the replaced range began and ended.
+- Session state is more robust against a corrupt or hand-edited state file:
+  malformed compression-block entries are dropped on load and the file heals
+  itself, the block-id counter can no longer be reset into a collision with an
+  existing block, and a failure inside the compression step is rolled back
+  instead of leaving half-applied state on disk.
+
+**NEW**
+
+- `strategies.guardToolPairs` (default **on**) is the escape hatch for the pair
+  protection described above. Turn it off only if you are debugging the guard
+  itself — see [Tool-pair guard](#tool-pair-guard) for the full semantics.
 
 ### 3.0.1
 
