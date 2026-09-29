@@ -19,7 +19,8 @@ import { resolveCompressLimits, resolveThreshold } from "../src/lib/config"
 // Namespace import so optional test hooks (resetThresholdWarnings) can be
 // probed at runtime without breaking the module graph when they are absent.
 import * as configModule from "../src/lib/config"
-import { buildPanelData, renderPanel } from "../src/lib/tui"
+import { buildPanelData, renderPanel, formatTokens } from "../src/lib/tui"
+import { loadConfig } from "../src/lib/config"
 // `measureSession` is a test-only export (see its JSDoc): the rendered
 // surfaces gate occupancy on `hasPrompt`, so the fallback it guards is
 // unreachable from /panel, /status or /compress.
@@ -667,6 +668,490 @@ describe("Pruning Strategies", () => {
         // c1 (stale, index 0) is purged; c2 (recent, index 3) is untouched.
         assert.ok(messages[0].content[0].input.content.startsWith("[input removed"))
         assert.strictEqual(messages[3].content[0].input.content, "B".repeat(500))
+    })
+})
+
+// ─── purgeStaleToolErrors on the v2 hook shape ─────────────────────────────
+//
+// Regression class this section exists for: the id read. On the v2 hook part
+// (`node_modules/@opencode/ai/dist/schema/messages.js` — ToolCallPart and
+// ToolResultPart both REQUIRE `id`) there is no `toolCallID` and no `callID`.
+// The function used to read only those two, so `pairingIdOf` yielded
+// undefined on every part, the errored-id set came back empty, and the
+// function returned before touching anything — on EVERY request, despite
+// `strategies.purgeErrors.enabled` defaulting to true. Every test that shipped
+// with it used the legacy `toolCallID` shape, which never reaches production,
+// so the defect was green in CI.
+//
+// Every fixture below is therefore built on `id`, and each asserts its own
+// precondition (the part really carries the id the implementation will look
+// for, the result really is an error) BEFORE asserting the outcome — so a test
+// cannot pass by failing to pair at all.
+
+describe("purgeStaleToolErrors: the v2 hook shape", () => {
+    /** The marker the production code writes. */
+    const MARKER = "[input removed due to failed tool call]"
+
+    /** 81 chars: one over the `> 80` threshold, so it must be replaced. */
+    const OVER = "A".repeat(81)
+
+    /** Exactly 80: the threshold is `> 80`, so this must survive. */
+    const AT_LIMIT = "B".repeat(80)
+
+    /** An errored v2 tool-call at message index `i`, with its result attached. */
+    function erroredPair(
+        i: number,
+        callId: string,
+        input: Record<string, unknown>,
+        resultType = "error",
+        resultValue = "boom",
+    ): [any, any] {
+        return [
+            {
+                id: `m${i}`,
+                role: "assistant",
+                content: [{ type: "tool-call", id: callId, name: "edit", input }],
+            },
+            {
+                id: `r${i}`,
+                role: "tool",
+                content: [
+                    {
+                        type: "tool-result",
+                        id: callId,
+                        name: "edit",
+                        result: { type: resultType, value: resultValue },
+                    },
+                ],
+            },
+        ]
+    }
+
+    function callInputAt(messages: any[], i: number): any {
+        return messages[i].content[0].input
+    }
+
+    /**
+     * Pad to `n` messages. The age gate is `i > n - turns - 1`, so index 0 is
+     * only eligible once `n >= turns + 1` — a short fixture proves nothing,
+     * because every index is gated out and the purge would be a no-op for
+     * reasons unrelated to the id read. Every fixture below is padded and
+     * asserts its eligibility explicitly.
+     */
+    function padTo(messages: any[], n: number, turns: number): any[] {
+        while (messages.length < n) {
+            messages.push({
+                id: `pad${messages.length}`,
+                role: "user",
+                content: [{ type: "text", text: `pad ${messages.length}` }],
+            })
+        }
+        assert.ok(
+            0 <= messages.length - turns - 1,
+            `fixture is too short (n=${messages.length}, turns=${turns}): index 0 would be ` +
+                `gated out, so this test could not fail for the reason it claims to check`,
+        )
+        return messages
+    }
+
+    it("purges a large input on the v2 shape, where the pairing id is `id`", () => {
+        // THE regression. `toolCallID`/`callID` do not exist on these parts, so
+        // the pre-fix implementation found no errored ids and returned early —
+        // this test fails against it.
+        const messages: any[] = padTo([...erroredPair(0, "call_v2", { content: OVER })], 6, 4)
+        // Precondition: the parts carry the id the implementation must read,
+        // and carry none of the legacy keys that used to be the only source.
+        assert.strictEqual(messages[0].content[0].id, "call_v2", "fixture must use `id`")
+        assert.strictEqual(messages[1].content[0].id, "call_v2", "result must share the `id`")
+        assert.strictEqual(
+            messages[1].content[0].result.type,
+            "error",
+            "fixture must actually be an errored result, or nothing should fire",
+        )
+        assert.strictEqual(
+            "toolCallID" in messages[0].content[0],
+            false,
+            "fixture must not carry the legacy key, or it proves nothing",
+        )
+        assert.strictEqual(callInputAt(messages, 0).content.length, 81, "input starts over the threshold")
+
+        purgeStaleToolErrors(messages, 4)
+
+        assert.strictEqual(
+            callInputAt(messages, 0).content,
+            MARKER,
+            "an errored v2 tool-call's oversized input must be replaced",
+        )
+    })
+
+    it("leaves a successful call untouched even when it is old and oversized", () => {
+        // Negative: `result.type !== "error"` must never purge. Guard against a
+        // fix that keys off "has a result" instead of "the result is an error".
+        const messages: any[] = padTo(
+            [
+                ...erroredPair(0, "ok1", { content: OVER }, "text", "fine"),
+                ...erroredPair(2, "ok2", { content: OVER }, "text", "fine"),
+            ],
+            6,
+            4,
+        )
+        assert.strictEqual(messages[1].content[0].result.type, "text", "fixture must NOT be an error")
+        // Precondition: index 0 is age-eligible (gate: i > 6-4-1 = 1), so the
+        // only reason to spare it is that its result is not an error.
+        assert.strictEqual(0 > 6 - 4 - 1, false, "index 0 must be inside the age window for this fixture")
+
+        purgeStaleToolErrors(messages, 4)
+
+        assert.strictEqual(callInputAt(messages, 0).content, OVER, "a successful call must be untouched")
+    })
+
+    it("purges one position inside the turns window and spares the boundary position", () => {
+        // The gate is `i > n - turnsEffective - 1` → continue, so with n=6 and
+        // turns=4 the eligible indices are 0..1 and the boundary is index 2.
+        // Both calls are errored and oversized; only the age differs, so this
+        // pins the window and nothing else.
+        const messages: any[] = []
+        // n=6, turns=4 → the gate `i > 6 - 4 - 1` is `i > 1`, so index 1 is the LAST
+        // eligible position and index 2 is the FIRST gated-out one. Both calls
+        // are errored and oversized; only the index differs.
+        messages.push(...erroredPair(0, "inside", { content: OVER }).slice(0, 1)) // index 0: call
+        messages.push({ id: "filler", role: "user", content: [{ type: "text", text: "f" }] }) // 1
+        messages.push(...erroredPair(2, "boundary", { content: OVER }).slice(0, 1)) // index 2: call
+        // Both results, then padding to reach the length the gate is computed from.
+        messages.push(...erroredPair(0, "inside", { content: OVER }).slice(1)) // index 3
+        messages.push(...erroredPair(2, "boundary", { content: OVER }).slice(1)) // index 4
+        messages.push({ id: "tail", role: "user", content: [{ type: "text", text: "recent" }] }) // 5
+        assert.strictEqual(messages.length, 6, "the age gate is computed from the array length")
+        assert.strictEqual(
+            1 > 6 - 4 - 1,
+            false,
+            "index 1 is the last eligible position, else this proves nothing",
+        )
+        assert.strictEqual(
+            2 > 6 - 4 - 1,
+            true,
+            "index 2 is the first gated-out position, else this proves nothing",
+        )
+
+        purgeStaleToolErrors(messages, 4)
+
+        assert.strictEqual(
+            callInputAt(messages, 0).content,
+            MARKER,
+            "index 0 is strictly inside the window and must be purged",
+        )
+        assert.strictEqual(
+            callInputAt(messages, 2).content,
+            OVER,
+            "index 2 is the first gated-out position and must be untouched",
+        )
+    })
+
+    it("keeps an input of exactly 80 characters and replaces 81", () => {
+        // `> 80` is strict: the boundary value is NOT over the threshold. An
+        // off-by-one to `>= 80` would silently rewrite inputs that were small
+        // enough to be worth keeping.
+        // Both calls sit at eligible indices (index 0 and index 1 of n=6), so the
+        // ONLY variable between them is the string length.
+        const messages: any[] = padTo(
+            [
+                ...erroredPair(0, "over", { content: OVER }).slice(0, 1), // 0: 81-char call
+                ...erroredPair(0, "atlimit", { content: AT_LIMIT }).slice(0, 1), // 1: 80-char call
+                ...erroredPair(0, "over", { content: OVER }).slice(1), // 2: "over"'s result
+                ...erroredPair(0, "atlimit", { content: AT_LIMIT }).slice(1), // 3: "atlimit"'s result
+            ],
+            6,
+            4,
+        )
+        assert.strictEqual(messages.length, 6, "the age gate is computed from the array length")
+        assert.strictEqual(0 > 6 - 4 - 1, false, "index 0 must be inside the age window for this fixture")
+        assert.strictEqual(1 > 6 - 4 - 1, false, "index 1 must be inside the age window for this fixture")
+        assert.strictEqual(AT_LIMIT.length, 80, "fixture boundary must be exactly 80 chars")
+        assert.strictEqual(OVER.length, 81, "fixture over-limit must be exactly 81 chars")
+
+        purgeStaleToolErrors(messages, 4)
+
+        assert.strictEqual(
+            callInputAt(messages, 0).content,
+            MARKER,
+            "81 chars is over the threshold and must be replaced",
+        )
+        assert.strictEqual(
+            callInputAt(messages, 1).content,
+            AT_LIMIT,
+            "80 chars is not over the threshold and must be kept verbatim",
+        )
+    })
+
+    it("never rewrites a non-string input value, whatever its size", () => {
+        // Only `typeof value === "string"` is in scope: a large object or array
+        // in `input` (a structured edit payload, a file map) must not be
+        // swapped for a string marker, which would change the request's shape.
+        //
+        // The assertion compares against a `structuredClone` SNAPSHOT taken
+        // before the call, not against `input` itself. `purgeStaleToolErrors`
+        // mutates in place, so `after` IS the same object reference as `input`:
+        // `deepStrictEqual(x, x)` is true no matter what the function did, and
+        // the previous version of this test kept passing after every value in
+        // the object had been destroyed. It also carries a paired control — a
+        // sibling call holding an over-threshold STRING — so a regression that
+        // rewrites everything indiscriminately cannot pass.
+        const input = {
+            num: 12345678901234567890,
+            obj: { blob: "C".repeat(500) },
+            arr: ["D".repeat(500)],
+            nil: null,
+            undef: undefined,
+            bool: true,
+        }
+        const snapshot = structuredClone(input)
+
+        const control = { content: OVER }
+        // Shape pair at indices 0/1, control pair at 2/3. The age gate is
+        // `i > n - turns - 1`, so n=8/turns=4 leaves indices 0..3 eligible —
+        // BOTH pairs are inside the window, which is what makes the control
+        // meaningful.
+        const messages: any[] = padTo(
+            [
+                ...erroredPair(0, "shapes", input),
+                {
+                    id: "m2c",
+                    role: "assistant",
+                    content: [
+                        {
+                            type: "tool-call",
+                            id: "call_control",
+                            name: "edit",
+                            input: control,
+                        },
+                    ],
+                },
+                {
+                    id: "m2r",
+                    role: "tool",
+                    content: [
+                        {
+                            type: "tool-result",
+                            id: "call_control",
+                            name: "edit",
+                            result: { type: "error", value: "boom" },
+                        },
+                    ],
+                },
+            ],
+            8,
+            4,
+        )
+        assert.strictEqual(
+            messages[1].content[0].result.type,
+            "error",
+            "fixture must be an errored call, or this passes vacuously",
+        )
+        assert.strictEqual(
+            messages[3].content[0].result.type,
+            "error",
+            "control must also be errored, or the control assertion proves nothing",
+        )
+        assert.ok(
+            0 <= 3 - (8 - 4 - 1),
+            "control pair at index 2 must be inside the age window, or the control proves nothing",
+        )
+
+        purgeStaleToolErrors(messages, 4)
+
+        // Control first: proves the function RAN and the purge path is live.
+        assert.strictEqual(
+            control.content,
+            MARKER,
+            "control: an over-threshold string on a sibling call MUST be rewritten, " +
+                "otherwise this test cannot prove it ran and a rewrite-everything " +
+                "regression would pass",
+        )
+
+        const after = callInputAt(messages, 0)
+        assert.deepStrictEqual(
+            after,
+            snapshot,
+            "no non-string input value may be rewritten",
+        )
+        assert.strictEqual(
+            after.obj.blob.length,
+            500,
+            "a nested large string is still a value, not a top-level string",
+        )
+    })
+
+    it("pairs on `callID` when a v1 part also carries a disagreeing `id`", () => {
+        // THE precedence fix. On the v1 ToolPart shape a part carries BOTH `id`
+        // (the PART id, `prt_*`) and `callID` (the CALL id). The CALL lives in
+        // the assistant message and the RESULT in a separate `role:"tool"`
+        // message, so the two sides carry DIFFERENT `id`s and the SAME `callID`.
+        //
+        // This test was previously written to assert the OPPOSITE (`id` wins),
+        // and was green for the wrong reason: the only thing it pinned was the
+        // order of the two reads, and the order it pinned mispaired every real
+        // v1 split pair. The fixture below is the shape that actually occurs —
+        // the two sides disagree on `id` — so `id`-first cannot pair them.
+        const messages: any[] = padTo(
+            [
+                {
+                    id: "m1",
+                    role: "assistant",
+                    content: [
+                        {
+                            type: "tool-call",
+                            id: "prt_CALL",
+                            callID: "call_1",
+                            name: "edit",
+                            input: { content: OVER },
+                        },
+                    ],
+                },
+                {
+                    id: "m2",
+                    role: "tool",
+                    content: [
+                        {
+                            type: "tool-result",
+                            id: "prt_RES",
+                            callID: "call_1",
+                            name: "edit",
+                            result: { type: "error", value: "boom" },
+                        },
+                    ],
+                },
+            ],
+            6,
+            4,
+        )
+        assert.strictEqual(
+            messages[0].content[0].callID,
+            messages[1].content[0].callID,
+            "precondition: the split pair shares one `callID`",
+        )
+        assert.ok(
+            messages[0].content[0].id !== messages[1].content[0].id,
+            "precondition: the PART ids must differ, else `id`-first would pair them and this could not detect it",
+        )
+
+        purgeStaleToolErrors(messages, 4)
+
+        assert.strictEqual(
+            callInputAt(messages, 0).content,
+            MARKER,
+            "`callID` must win over a disagreeing `id`; reading `id` first mispairs a v1 split pair and purges nothing",
+        )
+    })
+
+    it("pairs on `id` on the v2 shape, which carries no `callID`", () => {
+        // The other half of the precedence. A v2 part has no `callID` at all,
+        // so the legacy read falls through and `id` — which IS the pairing id
+        // there — must still be used. Without this, "legacy first" would be
+        // read as "never read `id`" and v2 pairing would break.
+        const messages: any[] = padTo([...erroredPair(0, "call_v2", { content: OVER })], 6, 4)
+        assert.strictEqual(
+            messages[0].content[0].callID,
+            undefined,
+            "precondition: a v2 part carries no `callID`, so the fallback must be `id`",
+        )
+        assert.strictEqual(
+            messages[0].content[0].id,
+            messages[1].content[0].id,
+            "precondition: the v2 pair shares one `id`",
+        )
+
+        purgeStaleToolErrors(messages, 4)
+
+        assert.strictEqual(callInputAt(messages, 0).content, MARKER)
+    })
+})
+
+// ─── collectProtectedToolOutputs: protected OUTPUTS in the summary ──────────
+//
+// The same broken id read lived in `collectProtectedToolOutputs`, which feeds
+// the "### Protected Tool Outputs" section of a compression summary. It matched
+// results by `toolCallID`/`callID`, so on the v2 shape it never produced the
+// `output:` half of a line — a user who listed a tool as protected was told its
+// output was preserved, and the summary silently preserved only the INPUT. That
+// is user-visible content loss in the summary, so it is pinned directly.
+
+describe("buildCompressionSummary: protected tool outputs survive compression", () => {
+    it("carries BOTH the input and the output of a protected v2 tool pair", async () => {
+        const messages: any[] = [
+            {
+                info: { id: "1", role: "user", sessionID: "s1", time: { created: 0 } },
+                parts: [{ type: "text", text: "run the build" }],
+            },
+            {
+                info: { id: "2", role: "assistant", sessionID: "s1", time: { created: 0 } },
+                parts: [{ type: "tool-call", id: "call_1", name: "bash", input: { command: "npm run build" } }],
+            },
+            {
+                info: { id: "3", role: "tool", sessionID: "s1", time: { created: 0 } },
+                parts: [
+                    {
+                        type: "tool-result",
+                        id: "call_1",
+                        name: "bash",
+                        result: { type: "text", value: "BUILD OK" },
+                    },
+                ],
+            },
+        ] as any
+
+        // Preconditions: the pair is joined on `id` and carries no legacy key.
+        assert.strictEqual((messages[1].parts[0] as any).id, "call_1", "fixture must use `id`")
+        assert.strictEqual((messages[2].parts[0] as any).id, "call_1", "result must share the `id`")
+        assert.strictEqual("toolCallID" in (messages[1].parts[0] as any), false, "no legacy key on the fixture")
+
+        const summary = await buildCompressionSummary(messages, "the build", ["bash"])
+
+        assert.ok(summary.includes("### Protected Tool Outputs"), `expected the section:\n${summary}`)
+        assert.ok(
+            summary.includes("npm run build"),
+            `the protected tool's INPUT must be in the summary:\n${summary}`,
+        )
+        assert.ok(
+            summary.includes("BUILD OK"),
+            `the protected tool's OUTPUT must be in the summary; it was silently dropped because ` +
+                `the result was matched by a legacy id key that does not exist on the v2 shape:\n${summary}`,
+        )
+    })
+
+    it("omits the output half when the tool result itself is an error", async () => {
+        // Documents the existing filter: an errored result contributes no
+        // output (purgeStaleToolErrors rewrites the input instead), but the
+        // call's input is still listed so the turn is not lost entirely.
+        const messages: any[] = [
+            {
+                info: { id: "1", role: "user", sessionID: "s1", time: { created: 0 } },
+                parts: [{ type: "text", text: "try it" }],
+            },
+            {
+                info: { id: "2", role: "assistant", sessionID: "s1", time: { created: 0 } },
+                parts: [{ type: "tool-call", id: "call_e", name: "bash", input: { command: "boom" } }],
+            },
+            {
+                info: { id: "3", role: "tool", sessionID: "s1", time: { created: 0 } },
+                parts: [
+                    {
+                        type: "tool-result",
+                        id: "call_e",
+                        name: "bash",
+                        result: { type: "error", value: "exit 1" },
+                    },
+                ],
+            },
+        ] as any
+
+        const summary = await buildCompressionSummary(messages, "the build", ["bash"])
+
+        assert.ok(summary.includes("command"), `the call input is still listed:\n${summary}`)
+        // Scope to the section under test: the error VALUE legitimately appears
+        // in the separate "### Errors Encountered" section, so asserting on the
+        // whole summary would fail for an unrelated and correct reason.
+        const section = summary.slice(summary.indexOf("### Protected Tool Outputs"))
+        assert.ok(!section.includes("exit 1"), `an errored result must not contribute an output half:\n${section}`)
     })
 })
 
@@ -3111,14 +3596,22 @@ describe("Panel box width", () => {
         // drops `formatTokens` from this line overflows here even though the
         // 56.1M rendering still fits comfortably.
         //
-        // Swept up to 1e9, which `formatTokens` renders as "1000.0M" (6 chars).
-        // NOT swept to 1e12: `formatTokens` scales in a single step
-        // (`>= 1e6 → /1e6`), so 999_999_999_999 renders as the 10-character
-        // "1000000.0M" and overflows the frame. That is a separate pre-existing
-        // defect in the formatter (present at HEAD, unrelated to #11) and is
-        // reported rather than pinned here, since fixing it means editing
-        // `src/` outside this task's remit.
-        for (const lifetime of [1, 999, 1_000, 999_999, 1_000_000, 56_100_000, 999_999_999]) {
+        // Swept to the magnitudes that used to break it: `formatTokens` scales
+        // one step per 1e3 (K/M/G/T), so 1e12 renders "1.0T" and
+        // MAX_SAFE_INTEGER renders the 7-character "9007.2T" — both inside the
+        // 7 columns the 56-column fixed text of this line leaves.
+        for (const lifetime of [
+            1,
+            999,
+            1_000,
+            999_999,
+            1_000_000,
+            56_100_000,
+            999_999_999,
+            999_999_999_999, // was "1000000.0M" — 10 chars, punched through
+            1e12,
+            Number.MAX_SAFE_INTEGER,
+        ]) {
             const text = await panelTextFor({
                 promptTokens: 1_000,
                 contextLimit: 200_000,
@@ -3564,5 +4057,220 @@ describe("measureSession occupancy source", () => {
                 `lifetime=${lifetime} with no per-turn usage must not produce occupancy`,
             )
         }
+    })
+})
+
+// ─── purgeErrors: the default-off flag ─────────────────────────────────────
+//
+// The pair of facts this section exists to hold together:
+//   (a) the id read is FIXED, so the strategy is no longer inert;
+//   (b) it is nonetheless OFF by default, so enabling it is an explicit choice
+//       rather than a silent behaviour change on a patch release.
+// Dropping either half is a real defect — (a) alone would rewrite every
+// existing user's errored tool inputs; (b) alone leaves the fix dormant.
+
+describe("purgeErrors: default-off and config merge", () => {
+    /** loadConfig with XDG_CONFIG_HOME pointed at an empty scratch dir. */
+    async function configWith(file: string | null): Promise<any> {
+        const previousXdg = process.env.XDG_CONFIG_HOME
+        const dir = await mkdtemp(join(tmpdir(), "slim-purge-cfg-"))
+        process.env.XDG_CONFIG_HOME = dir
+        try {
+            if (file !== null) {
+                const { mkdir, writeFile } = await import("node:fs/promises")
+                await mkdir(join(dir, "opencode"), { recursive: true })
+                await writeFile(join(dir, "opencode", "slim.jsonc"), file, "utf-8")
+            }
+            // Precondition: with no file there is nothing for loadConfig to read.
+            if (file === null) {
+                assert.strictEqual(
+                    existsSync(join(dir, "opencode", "slim.jsonc")),
+                    false,
+                    "the no-file case must really have no config to read",
+                )
+            }
+            return loadConfig()
+        } finally {
+            if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME
+            else process.env.XDG_CONFIG_HOME = previousXdg
+            await rm(dir, { recursive: true, force: true })
+        }
+    }
+
+    it("ships purgeErrors disabled, with turns and protectedTools still present", async () => {
+        const config = await configWith(null)
+        assert.strictEqual(
+            config.strategies.purgeErrors.enabled,
+            false,
+            "purgeErrors must be off by default now that it actually does something",
+        )
+        assert.strictEqual(
+            config.strategies.purgeErrors.turns,
+            4,
+            "disabling must not drop the sibling keys the strategy still needs",
+        )
+        assert.deepStrictEqual(
+            config.strategies.purgeErrors.protectedTools,
+            [],
+            "the protectedTools whitelist must survive alongside the disabled flag",
+        )
+    })
+
+    it("a partial override of turns keeps the disabled flag (per-sub-object merge)", async () => {
+        // The merge is a whitelist of sub-object spreads. If `purgeErrors` were
+        // merged as a whole-object REPLACEMENT, this user's override would drop
+        // `enabled` from the object entirely — and `undefined` is falsy, which
+        // would silently disable the strategy they were trying to configure.
+        const config = await configWith('{ "strategies": { "purgeErrors": { "turns": 2 } } }')
+        assert.strictEqual(
+            config.strategies.purgeErrors.turns,
+            2,
+            "the user's override must apply",
+        )
+        assert.strictEqual(
+            config.strategies.purgeErrors.enabled,
+            false,
+            "a partial override must inherit the default flag, not drop the key",
+        )
+        assert.ok(
+            "enabled" in config.strategies.purgeErrors,
+            "`enabled` must be present, not merely falsy by omission",
+        )
+    })
+
+    it("a partial override of protectedTools keeps the disabled flag", async () => {
+        const config = await configWith('{ "strategies": { "purgeErrors": { "protectedTools": ["bash"] } } }')
+        assert.deepStrictEqual(config.strategies.purgeErrors.protectedTools, ["bash"])
+        assert.strictEqual(
+            config.strategies.purgeErrors.enabled,
+            false,
+            "overriding one sibling must not resurrect or erase the flag",
+        )
+    })
+
+    it("an explicit enabled: true in the user's config turns the strategy on", async () => {
+        // The other half of the pair: the flag is a real switch, not a hard-off.
+        const config = await configWith('{ "strategies": { "purgeErrors": { "enabled": true } } }')
+        assert.strictEqual(config.strategies.purgeErrors.enabled, true, "opt-in must work")
+    })
+})
+
+// ─── formatTokens: width budget and back-compatibility ─────────────────────
+//
+// Regression class: the formatter was duplicated byte-for-byte in two files and
+// scaled ONE step per 1e3, so `999999999999` rendered as "1000000.0M" — 10
+// characters where the panel frame allows 4, punching straight through the
+// box border. It is now one exported implementation with a progressive
+// T/G/M/K ladder.
+//
+// The panel-level suite above proves the rendered LINE fits; this section pins
+// the formatter itself, and — just as important — proves that nothing below the
+// overflow point changed. A fix that reformatted everything to be "nicer"
+// would silently alter the panel text that other tests assert verbatim, and
+// that is a user-visible change nobody asked for.
+
+describe("formatTokens", () => {
+    /**
+     * The widest form the ladder can produce for any REACHABLE input: 7
+     * characters ("1000.0M" / "1000.0G" / "9007.2T") — a 4-digit mantissa plus
+     * ".0" and the unit suffix. The old single-step version exceeded this
+     * ("1000000.0M", 10 chars), which is what punched through the box frame.
+     *
+     * Bounded by `Number.MAX_SAFE_INTEGER`, the largest input any token count
+     * can reach. Beyond that (1e18 renders "1000000.0T", 10 chars) the ladder
+     * runs out of rungs — asserted explicitly below rather than silently
+     * excluded, so the limit of this guarantee is on the record.
+     */
+    const BUDGET = 7
+
+    it("never renders more than the character budget, at any reachable magnitude", () => {
+        // Swept across every ladder step and the values just below each one,
+        // where an off-by-one in the ladder comparison would show up.
+        const magnitudes = [
+            0, 1, 9, 10, 99, 100, 999, 1_000, 1_001, 1_499, 9_999, 999_999,
+            1_000_000, 56_100_000, 999_999_999, 1_000_000_000, 1_500_000_000,
+            999_999_999_999, 1e12, 1.5e12, 1e15, 1e15 + 1,
+            Number.MAX_SAFE_INTEGER,
+        ]
+        for (const tokens of magnitudes) {
+            const rendered = formatTokens(tokens)
+            assert.ok(
+                rendered.length <= BUDGET,
+                `formatTokens(${tokens}) = ${JSON.stringify(rendered)} is ` +
+                    `${rendered.length} chars, over the ${BUDGET}-char budget`,
+            )
+        }
+
+        // The exact instance that overflowed: single-step scaling rendered this
+        // as "1000000.0M". Assert the value, not just the length, so a fix
+        // cannot pass by emitting some other 10-char string.
+        assert.strictEqual(formatTokens(999_999_999_999), "1000.0G", "the overflow instance itself")
+        assert.strictEqual(formatTokens(1e12), "1.0T", "1e12 must take the T rung")
+        assert.strictEqual(formatTokens(Number.MAX_SAFE_INTEGER), "9007.2T", "the largest input")
+    })
+
+    it("renders every sub-1e9 value byte-identically to the previous implementation", () => {
+        // Nothing below the overflow point may have changed. These are the exact
+        // strings the panel tests assert elsewhere ("150.0K", "1.0M"), so any
+        // drift here is a visible change to already-asserted panel output.
+        // The trailing ".0" is deliberate — it distinguishes a rounded figure
+        // from a count — and must NOT be "cleaned up".
+        const expected: Array<[number, string]> = [
+            [0, "0"],
+            [1, "1"],
+            [999, "999"], // below 1000: printed exactly, never "999.0"
+            [1_000, "1.0K"],
+            [1_200, "1.2K"],
+            [150_000, "150.0K"],
+            [1_000_000, "1.0M"],
+            [56_100_000, "56.1M"],
+            [999_999_999, "1000.0M"], // the largest pre-fix-safe mantissa: exactly at the budget
+        ]
+        for (const [tokens, want] of expected) {
+            assert.strictEqual(
+                formatTokens(tokens),
+                want,
+                `formatTokens(${tokens}) must be unchanged below 1e9 — this string appears ` +
+                    `verbatim in the panel's own output`,
+            )
+        }
+    })
+
+    it("picks the largest rung that fits, so the mantissa never exceeds 4 digits", () => {
+        // The bound is 4 mantissa digits ("1000.0"), not 3: with a T rung at
+        // 1e12 there is no 4-digit mantissa left to overflow into, so "1000.0G"
+        // is the widest legitimate rendering. What must NEVER appear is the
+        // old unbounded quotient ("1000000.0M"), which is 5+ digits.
+        for (const [tokens, suffix] of [
+            [1_000_000_000, "G"],
+            [999_999_999_999, "G"],
+            [1e12, "T"],
+            [1e15, "T"],
+        ] as const) {
+            const rendered = formatTokens(tokens)
+            assert.strictEqual(
+                rendered.endsWith(suffix),
+                true,
+                `formatTokens(${tokens}) = ${JSON.stringify(rendered)} should use the ${suffix} rung`,
+            )
+            assert.ok(
+                rendered.length <= BUDGET,
+                `formatTokens(${tokens}) = ${JSON.stringify(rendered)} exceeds the 4-digit-mantissa bound; ` +
+                    `the ladder must step up rather than print an unbounded quotient`,
+            )
+        }
+    })
+
+    it("stays within budget all the way to MAX_SAFE_INTEGER, and the bound is MAX_SAFE_INTEGER", () => {
+        // The ladder has four rungs (T at 1e12 is the top), so the guarantee
+        // holds exactly as far as a token count can reach. Past
+        // MAX_SAFE_INTEGER there is no rung left and the quotient grows
+        // unbounded again — documenting that ceiling is honest; pretending the
+        // budget is universal would not be.
+        assert.ok(formatTokens(Number.MAX_SAFE_INTEGER).length <= BUDGET, "the largest real input fits")
+        // The 7-column budget is what the LIFETIME call site needs; the
+        // wider-number lines (Trigger, Prune) are a separate pre-existing
+        // defect and are deliberately out of scope here — see the
+        // `formatTokens` comment in src/lib/tui.ts.
     })
 })

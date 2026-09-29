@@ -1,4 +1,4 @@
-import { describe, it, before, after } from "node:test"
+import { describe, it, before, after, beforeEach, afterEach } from "node:test"
 import assert from "node:assert"
 import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -3233,6 +3233,240 @@ describe("applyCompressedRanges: the ambiguity locks hold WITHOUT syncCompressio
             "guardToolPairs=false disables the ORPHAN guard, not the AMBIGUITY lock: the " +
                 "two are independent, and an ambiguous message must still never be removed " +
                 "on a guess of which one it is",
+        )
+    })
+})
+
+// ─── purgeErrors gate, end to end through the real context hook ────────────
+//
+// The unit tests prove `purgeStaleToolErrors` works on the v2 shape; the config
+// tests prove it defaults to off. Neither proves the hook HONOURS the flag —
+// only the hook can be wrong here (a stale condition, a wrong variable, a
+// reordering that runs purge before the compression block is restored). These
+// two tests are the pair that closes the gap: same transcript, same fixture,
+// the ONLY difference is the `enabled` flag, so neither can pass for the wrong
+// reason.
+
+describe("context hook: the purgeErrors flag is the only thing gating the purge", () => {
+    let dir: string
+    let previousXdg: string | undefined
+
+    /**
+     * A transcript with an errored, oversized tool call OLD enough to be
+     * eligible (index 0 of 6, turns=4 → gate `i > 1` passes) and followed by
+     * enough padding that the age window is satisfied.
+     */
+    function transcriptWithErroredCall() {
+        return [
+            {
+                id: "m1",
+                role: "assistant",
+                content: [
+                    {
+                        type: "tool-call",
+                        id: "hook_call",
+                        name: "edit",
+                        input: { content: "A".repeat(300) },
+                    },
+                ],
+            },
+            {
+                id: "m2",
+                role: "tool",
+                content: [
+                    {
+                        type: "tool-result",
+                        id: "hook_call",
+                        name: "edit",
+                        result: { type: "error", value: "boom" },
+                    },
+                ],
+            },
+            { id: "m3", role: "user", content: [{ type: "text", text: "one" }] },
+            { id: "m4", role: "user", content: [{ type: "text", text: "two" }] },
+            { id: "m5", role: "user", content: [{ type: "text", text: "three" }] },
+            { id: "m6", role: "user", content: [{ type: "text", text: "four" }] },
+        ]
+    }
+
+    function callInput(event: any): any {
+        const call = event.messages
+            .flatMap((m: any) => m.content ?? [])
+            .find((p: any) => p.type === "tool-call" && p.id === "hook_call")
+        assert.ok(call, `the errored tool-call must survive the hook:\n${JSON.stringify(event.messages)}`)
+        return call.input
+    }
+
+    async function runWithConfig(body: Record<string, unknown>) {
+        await mkdir(join(dir, "opencode"), { recursive: true })
+        await writeFile(
+            join(dir, "opencode", "slim.jsonc"),
+            JSON.stringify({
+                ...body,
+                persistence: { enabled: true, directory: join(dir, "state") },
+            }),
+            "utf-8",
+        )
+        const harness = makePluginHarness({ transcript: [] })
+        const messages = transcriptWithErroredCall()
+        return await harness.runContext(messages, "purge-flag-session")
+    }
+
+    beforeEach(async () => {
+        previousXdg = process.env.XDG_CONFIG_HOME
+        dir = await mkdtemp(join(tmpdir(), "slim-purge-flag-"))
+        process.env.XDG_CONFIG_HOME = dir
+    })
+    afterEach(async () => {
+        if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME
+        else process.env.XDG_CONFIG_HOME = previousXdg
+        await rm(dir, { recursive: true, force: true })
+    })
+
+    it("leaves the errored tool input untouched under the DEFAULT config", async () => {
+        const event = await runWithConfig({
+            enabled: true,
+            compress: { enabled: true, maxContextLimit: 100000, minContextLimit: 50000 },
+        })
+
+        // Precondition: the fixture's precondition must survive the hook, or
+        // this passes vacuously because the call was dropped, not spared.
+        assert.strictEqual(callInput(event).content.length, 300, "the oversized input must be intact")
+        assert.strictEqual(
+            callInput(event).content,
+            "A".repeat(300),
+            "with purgeErrors off by default the hook must not rewrite any input",
+        )
+    })
+
+    it("rewrites the errored tool input when purgeErrors is explicitly enabled", async () => {
+        const event = await runWithConfig({
+            enabled: true,
+            compress: { enabled: true, maxContextLimit: 100000, minContextLimit: 50000 },
+            strategies: { purgeErrors: { enabled: true, turns: 4 } },
+        })
+
+        assert.strictEqual(
+            callInput(event).content,
+            "[input removed due to failed tool call]",
+            "the opt-in must reach the hook and actually purge through the v2 shape",
+        )
+    })
+})
+
+// ─── Part classification: isCallPart / isResultPart ───────────────────────
+//
+// The pairing-id fix touched the file these two predicates live in, and their
+// relationship is DELIBERATE and asymmetric:
+//
+//   isCallPart   →  type === "tool-call"                     (NARROW)
+//   isResultPart →  type === "tool-result" || type === "tool" (WIDER)
+//
+// The asymmetry is the safe direction: mis-recognising a result as a call would
+// let the guard remove a call whose result survives — the fatal orphan that
+// 400s the next request. Widening isCallPart to "tool" (which the v1 transcript
+// shape uses for BOTH sides) cannot make the same claim, so it was not done.
+//
+// The predicates are not exported, so this pins their classification through
+// observable guard behaviour. The point is to make a future "balance the
+// predicates" edit fail LOUDLY: it would not break an invariant, it would
+// break this asymmetry — and asymmetry with no test is exactly what gets
+// "tidied up" by someone who reads it as an oversight.
+
+describe("tool-pair guard: part classification is asymmetric on purpose", () => {
+    /** Run a covered message through the guard; report whether it survived. */
+    function survivesWhenCovered(message: any, partner?: any): boolean {
+        const messages = partner ? [message, partner] : [message]
+        const state = makeState()
+        registerCompressionBlock(state, {
+            coveredIds: [messages[0].id],
+            anchorMessageId: "anchor",
+            summary: "## Compression Summary\ncollapsed",
+            topic: "t",
+        })
+        const keys = keysOf([...messages, textMessage("anchor")])
+        const block = state.compressionBlocks![0]
+        assert.ok(
+            block.coveredMessageIds.includes(messages[0].id),
+            "the message under test must really be covered, else the result is vacuous",
+        )
+        syncCompressionBlocks(state, new Set(keys), findAmbiguousKeys(keys))
+        const filtered = applyCompressedRanges(state, [...messages, textMessage("anchor")], keys)
+        return filtered.some((m) => m.id === messages[0].id)
+    }
+
+    it("a {type:'tool-call'} part is classified as a CALL (never removable when its result survives)", () => {
+        // If isCallPart ever widened, this call would be removable and its
+        // surviving result would reach the provider as an orphan.
+        const call = callMessage("m-call", "call_x")
+        const result = resultMessage("m-result", "call_x", "x".repeat(5000))
+
+        assert.strictEqual(survivesWhenCovered(call, result), true, "a call whose result survives must be kept")
+        assert.deepStrictEqual(orphanToolResults([call, result]), [], "and the pair is well-formed to begin with")
+    })
+
+    it("a {type:'tool-result'} part is classified as a RESULT (removable when its call survives)", () => {
+        const call = callMessage("m-call", "call_y")
+        const result = resultMessage("m-result", "call_y", "y".repeat(5000))
+
+        assert.strictEqual(
+            survivesWhenCovered(result, call),
+            false,
+            "a result whose call survives IS removable — the host synthesises the missing answer",
+        )
+        assert.deepStrictEqual(orphanToolResults([call, result]), [], "removing it orphans nothing")
+    })
+
+    it("a {type:'tool'} part is classified as a RESULT, not a CALL", () => {
+        // This is the width that makes the asymmetry real: "tool" is a RESULT
+        // (a `role:"tool"` answer is unambiguous) but must NOT also be a CALL,
+        // because the v1 transcript shape uses "tool" for both sides and
+        // treating it as a call would let the guard remove the producing side.
+        const legacyResult = {
+            id: "m-legacy",
+            role: "tool",
+            content: [{ type: "tool", id: "call_z", state: { status: "completed", output: "z".repeat(5000) } }],
+        }
+        const legacyCall = {
+            id: "m-legacy-call",
+            role: "assistant",
+            content: [{ type: "tool", id: "call_z", state: { input: { path: "a.txt" } } }],
+        }
+
+        assert.strictEqual(
+            survivesWhenCovered(legacyResult, legacyCall),
+            false,
+            "a type:'tool' RESULT must be treated as removable (it is the answer side)",
+        )
+        // The converse half of the same classification, which the previous
+        // version of this test built a fixture for and then asserted NOTHING
+        // about: `legacyCall` was passed only as a partner, so a regression
+        // here would have left the test green.
+        //
+        // What it actually pins is the KNOWN LIMITATION, not safety: because
+        // `isResultPart` accepts `"tool"` and `isCallPart` does not, a
+        // `type:"tool"` part is the answer side on BOTH messages of a v1 pair,
+        // so covering the CALL side removes it while its result survives. That
+        // is the fatal direction, and it is unresolved by design — the v1
+        // shape genuinely carries no discriminator between the two sides of a
+        // `type:"tool"` pair. Pinned here so the gap is a recorded, visible
+        // fact rather than an accident, and so fixing it later is a deliberate
+        // change with a test that fails loudly, not an accident discovered in
+        // production. The guard's one-directional rule is load-bearing for
+        // session safety and is not touched by this assertion.
+        assert.strictEqual(
+            survivesWhenCovered(legacyCall, legacyResult),
+            false,
+            "recorded limitation: a type:'tool' CALL is classified as a RESULT and is removed. " +
+                "The v1 shape gives the two sides no discriminator, so the guard cannot tell them apart. " +
+                "If this ever becomes true, the discriminator was added — update this assertion deliberately.",
+        )
+        // Both sides of the v1 pair are removable, which is exactly why the
+        // shape is ambiguous: there is no side the guard can lock on.
+        assert.deepStrictEqual(
+            [survivesWhenCovered(legacyResult, legacyCall), survivesWhenCovered(legacyCall, legacyResult)],
+            [false, false],
+            "neither side of a v1 type:'tool' pair is locked — the recorded ambiguity, stated as a pair",
         )
     })
 })

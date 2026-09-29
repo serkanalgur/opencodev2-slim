@@ -1,6 +1,6 @@
 {
   "name": "@serkanalgur/opencodev2-slim",
-  "version": "3.0.2",
+  "version": "3.0.3",
   "description": "Smart context management plugin for OpenCode v2 - semantic compression, cost-aware pruning, adaptive thresholds",
   "keywords": [
     "opencode",
@@ -34,6 +34,7 @@
     "dist/",
     "src/",
     "tsconfig.json",
+    "assets/",
     "README.md",
     "LICENSE"
   ],

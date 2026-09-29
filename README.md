@@ -157,7 +157,11 @@ Create `~/.config/opencode/slim.jsonc`:
             "protectedTools": []
         },
         "purgeErrors": {
-            "enabled": true,
+            // OFF by default. In 3.0.2 this was configured as `true` but
+            // matched nothing, because it looked for the pairing id on
+            // `toolCallID`/`callID` while the id lives on `part.id` — see
+            // "Purge-errors migration" below before turning it on.
+            "enabled": false,
             "turns": 4,
             "protectedTools": []
         },
@@ -270,6 +274,37 @@ The `panel` tool states this on its `Prune:` line (`… saved on last request`) 
 shows it only when pruning is enabled or the last request actually pruned
 something; with the default (off) the line is absent.
 
+### Purge-errors migration
+
+`strategies.purgeErrors` used to default to `enabled: true`, and if you never
+wrote the key into `slim.jsonc` you were running it. It did nothing. The
+strategy matches an errored tool result to its call, and it was reading the
+pairing id from `toolCallID` / `callID` — fields that do not exist on the v2
+message shape, where the id lives on `part.id`. Every lookup came back empty, so
+the purge never fired, on any request, for any session.
+
+The lookup is fixed, which means the strategy now does what its name says: for
+a tool call whose result errored, and which is at least `turns` positions behind
+the end of the conversation, every string value longer than 80 characters in its
+`input` is replaced with `[input removed due to failed tool call]`. The error
+itself and the rest of the input are kept.
+
+Because that is a visible change to the outgoing prompt from a path that had
+never executed, the default is now `enabled: false`.
+
+- **You never set the key.** Nothing changes for you. It stays off until you ask
+  for it.
+- **You set `purgeErrors.enabled: true` explicitly.** It now works. Expect the
+  rewritten inputs described above on the first request after upgrading, and
+  check that losing those long input values does not break anything you rely on
+  for error recovery — a failed call is exactly the one you may want to re-read.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `purgeErrors.enabled` | `false` | Master switch. Opt-in after 3.0.2. |
+| `purgeErrors.turns` | `4` | A call is only purged once it is at least this many messages from the end. |
+| `purgeErrors.protectedTools` | `[]` | Tool names exempt from the purge. Also honoured by `pruneOutputs.protectedTools`. |
+
 ### Tool-pair guard
 
 Compression blocks and deduplication both drop *whole* messages, which can
@@ -367,6 +402,49 @@ State is saved to disk, so compression history and learning persist across resta
 Note: Compression is performed by the AI assistant using the `compress` tool. The slash command provides guidance on usage; it is the only slash command that writes to the session, and it does so with an explicit `delivery: "steer"` (see [Compress Tool](#compress-tool)).
 
 ## Changelog
+
+### 3.0.3
+
+**BREAKING CHANGES**
+
+- `strategies.purgeErrors` now defaults to `enabled: false`. The strategy was
+  configured to run but could not match a call to its errored result: it read the
+  pairing id from `toolCallID` / `callID`, fields the v2 message shape does not
+  carry, so every lookup came back empty and the purge never fired on any
+  request. The lookup is fixed, and because it rewrites the outgoing prompt from
+  a path that had never executed, it is now opt-in. If you set the key
+  explicitly you get the working behaviour; if you never set it, nothing changes
+  for you until you ask for it — see
+  [Purge-errors migration](#purge-errors-migration).
+
+**FIXES**
+
+- Compression summaries no longer leave out the output half of a protected tool.
+  The same lookup bug meant `part.output` was silently missing from every
+  protected tool's section, so restoring it exposed a section bounded only by the
+  tool's own output size. The section is now capped and says so when it has been
+  truncated, so a compression is always smaller than the range it replaced.
+- Compression statistics can no longer report a negative saving. If a summary
+  ends up larger than the range it replaces, the recorded saving is now `0%`
+  rather than a negative figure, and the panel no longer prints negative tokens
+  or a negative dollar amount saved. A compression that does not shrink is not a
+  saving.
+- A very large token count is no longer rendered as a string that overflows the
+  panel. The token formatter was duplicated in two files and scaled in a single
+  step, so a large value printed as a ten-character run that broke out of the
+  panel frame. It is now one implementation with progressive units; values below
+  a billion are formatted exactly as before.
+
+**NEW**
+
+- The README banner is now included in the published package, so it renders on
+  npmjs without relying on npm to rewrite a relative image path.
+
+**DOCS**
+
+- Documented the `purgeErrors` opt-in default in
+  [Purge-errors migration](#purge-errors-migration), alongside the
+  [Tool-pair guard](#tool-pair-guard) it interacts with on the same messages.
 
 ### 3.0.2
 
