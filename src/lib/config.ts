@@ -38,6 +38,12 @@ const DEFAULT_CONFIG: SlimConfig = {
             turns: 4,
             protectedTools: [],
         },
+        // On by default: a strategy that drops whole messages (compression
+        // blocks, dedup) must not leave a tool result without its call, which
+        // the provider rejects. Escape hatch for a user who has reason to
+        // disable it; the plugin treats anything other than an explicit
+        // `false` as "guard on".
+        guardToolPairs: true,
         // Opt-in: `enabled: false` keeps the feature off unless the user asks.
         // Defaults here are the built-in fallbacks used when a field is absent,
         // so an omitted value and an explicit one behave identically.
@@ -87,6 +93,10 @@ function deepMerge(base: SlimConfig, override: Partial<SlimConfig>): SlimConfig 
         strategies: {
             deduplication: { ...base.strategies.deduplication, ...override.strategies?.deduplication },
             purgeErrors: { ...base.strategies.purgeErrors, ...override.strategies?.purgeErrors },
+            // Not a sub-object, but a top-level `strategies` key, so it needs
+            // its own merge line: without it a user's `guardToolPairs: false`
+            // would be silently dropped by the whitelist above.
+            guardToolPairs: override.strategies?.guardToolPairs ?? base.strategies.guardToolPairs,
             // Sub-object merges: a partial `pruneOutputs` override must keep the
             // other defaults (setting only `minChars` must not drop
             // `maxPerRequest`), and the keys must survive deepMerge at all or a

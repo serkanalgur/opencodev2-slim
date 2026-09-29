@@ -18,12 +18,65 @@ const DEFAULT_STATE: SessionState = {
     nudges: { contextLimitAnchors: [], turnNudgeAnchors: [], iterationNudgeAnchors: [] },
 }
 
+/** A usable block: an object carrying a numeric id, a string anchor and a
+ *  string array of covered ids. Anything else is corrupt. */
+function isValidBlock(b: unknown): boolean {
+    if (typeof b !== "object" || b === null || Array.isArray(b)) return false
+    const blk = b as Record<string, unknown>
+    return (
+        typeof blk.blockId === "number" &&
+        typeof blk.anchorMessageId === "string" &&
+        Array.isArray(blk.coveredMessageIds) &&
+        blk.coveredMessageIds.every((id) => typeof id === "string")
+    )
+}
+
 export function normalizeState(state: SessionState): SessionState {
-    state.compressionBlocks = Array.isArray(state.compressionBlocks) ? state.compressionBlocks : []
-    state.nextBlockId =
-        typeof state.nextBlockId === "number" && state.nextBlockId > 0
-            ? state.nextBlockId
-            : state.compressionBlocks.reduce((max, b) => Math.max(max, b.blockId), 0) + 1
+    // The state file is user-editable JSON on disk, so it is untrusted input.
+    // An array check alone is not enough: a single `null` (or otherwise
+    // malformed) entry survives to every downstream consumer, where it throws
+    // inside syncCompressionBlocks() on every request forever and inside the
+    // nextBlockId reduce — and because that reduce sits inside loadSessionState's
+    // try, the throw discards the ENTIRE file, throwing away every valid block
+    // along with it. Neither failure is self-healing, because the bad entry is
+    // re-persisted verbatim. Filter it out at the load boundary instead.
+    const rawBlocks = Array.isArray(state.compressionBlocks) ? state.compressionBlocks : []
+    const validBlocks = rawBlocks.filter(isValidBlock)
+    if (validBlocks.length !== rawBlocks.length) {
+        console.warn(
+            `[slim] dropped ${rawBlocks.length - validBlocks.length} malformed ` +
+                `compressionBlocks entr${rawBlocks.length - validBlocks.length === 1 ? "y" : "ies"} ` +
+                `from the saved session state.`,
+        )
+    }
+    state.compressionBlocks = validBlocks
+    // nextBlockId must be MONOTONIC and strictly greater than every SURVIVING
+    // blockId — a blockId is an identity, not just a list index: the injected
+    // `slim-summary-${blockId}` message is named after it, and
+    // registerCompressionBlock matches `consumedBlockIds` by it. Re-issuing a
+    // live id therefore collides an existing block with a new one AND gives
+    // two messages on the wire the same id.
+    //
+    // The stored value alone is not enough, and neither is the derived one:
+    //
+    //  - stored only → a file with NO `nextBlockId` key gets DEFAULT_STATE's
+    //    `1` from the load-time spread, which is a positive number, so the
+    //    derive never runs and a session holding blocks 1..7 mints a duplicate
+    //    blockId 1. Same for a stored value that simply fell behind (an
+    //    older version, a hand-edit, a partial write).
+    //  - derived only → ids already handed out would be re-issued after
+    //    resetOnCompaction cleared the block list, which the monotonicity note
+    //    on that function explicitly rules out.
+    //
+    // So the counter is the MAX of the two: the derived floor guarantees no
+    // collision among surviving blocks, the stored value carries the sequence
+    // forward across a compaction that emptied the list. A corrupt entry
+    // cannot skew it either, since the reduce runs over the filtered list.
+    const derivedNextBlockId =
+        state.compressionBlocks.reduce((max, b) => Math.max(max, b.blockId), 0) + 1
+    const storedNextBlockId =
+        typeof state.nextBlockId === "number" && state.nextBlockId > 0 ? state.nextBlockId : 0
+    state.nextBlockId = Math.max(storedNextBlockId, derivedNextBlockId)
     state.nudges = {
         contextLimitAnchors: Array.isArray(state.nudges?.contextLimitAnchors)
             ? state.nudges.contextLimitAnchors

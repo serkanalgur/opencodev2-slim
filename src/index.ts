@@ -205,6 +205,66 @@ function warnContextLimitFallback(
 
 // ─── State Management ───────────────────────────────────────────────────────
 
+/**
+ * Deep-enough snapshot of the compression blocks for rollback.
+ *
+ * `syncCompressionBlocks()` mutates three things before it can throw: each
+ * block's `active` flag, each block's `coveredMessageIds` (nested-consumption
+ * inheritance pushes onto the live array), and the `state.compressionBlocks`
+ * array itself (the orphan filter reassigns it). All three are persisted by
+ * `saveSessionState()` at the end of the context hook, so a throw partway
+ * through the apply step would otherwise write a half-applied state to disk —
+ * a block deactivated in the sync loop whose covered ids were never inherited is
+ * never resurrected by any other active block, so its messages silently
+ * re-enter the prompt forever with no summary to replace them.
+ *
+ * Deliberately a structural copy, not a reference: the point is to capture the
+ * VALUES as they were, because the mutation sites write through the same array
+ * objects. Deliberately not a full `structuredClone` — the only fields these
+ * two functions write are the three above, and cloning whole blocks would also
+ * clone any future field that must keep its object identity.
+ */
+type BlocksSnapshot = {
+    /** The array as it was, including its exact length. */
+    ref: CompressionBlock[] | undefined
+    /** `active` per block, by position in the ORIGINAL array. */
+    active: boolean[]
+    /** `coveredMessageIds` per block, by position in the ORIGINAL array. */
+    covered: string[][]
+}
+
+function snapshotCompressionBlocks(blocks: CompressionBlock[] | undefined): BlocksSnapshot {
+    const ref = blocks
+    if (!Array.isArray(blocks)) {
+        return { ref, active: [], covered: [] }
+    }
+    return {
+        ref,
+        // A corrupt persisted state can hold a `null` entry (that is exactly how
+        // the rollback path gets exercised), so nothing here may dereference a
+        // block unconditionally.
+        active: blocks.map((b) => (b as any)?.active === true),
+        covered: blocks.map((b) => [...((b?.coveredMessageIds as string[]) ?? [])]),
+    }
+}
+
+/**
+ * Undoes a snapshot taken before `syncCompressionBlocks()` ran. Restores the
+ * array reference (the orphan filter may have replaced it) and rewrites the two
+ * mutated fields on each surviving block IN PLACE, so any other holder of a
+ * block object sees the rollback too.
+ */
+function restoreCompressionBlocks(state: SessionState, snap: BlocksSnapshot): void {
+    state.compressionBlocks = snap.ref
+    if (!Array.isArray(snap.ref)) return
+    for (let i = 0; i < snap.ref.length; i++) {
+        const block = snap.ref[i] as any
+        if (!block || typeof block !== "object") continue
+        block.active = snap.active[i]
+        block.coveredMessageIds = snap.covered[i]
+    }
+}
+
 // Register a DCP-style compression block for the selected range. The range is
 // covered (removed from future outgoing requests) and the summary is injected
 // at the anchor: the first message after the range, or the latest message when
@@ -793,16 +853,78 @@ export default Plugin.define({
             //    ambiguous anchor.
             const ambiguousKeys = findAmbiguousKeys(keys)
             const presentIds = new Set(keys)
-            syncCompressionBlocks(state, presentIds, ambiguousKeys)
-            const beforeCount = event.messages.length
-            const filtered = applyCompressedRanges(state, event.messages, keys)
-            event.messages.splice(0, event.messages.length, ...filtered)
+            // Best-effort: the whole compression-apply step is a pure
+            // optimisation of the outgoing request. Anything it throws must
+            // leave BOTH `event.messages` and `state.compressionBlocks`
+            // exactly as they were — a plugin error must never become a failed
+            // provider request, nor a half-applied state that gets persisted.
+            //
+            // syncCompressionBlocks() mutates state BEFORE it can throw (it
+            // writes `block.active`, pushes inherited covered ids, and
+            // reassigns `state.compressionBlocks`), and `state` is written to
+            // disk by saveSessionState() at the end of this hook. So the catch
+            // has to roll the state back too, not just the message array: a
+            // block deactivated in the sync loop whose covered ids were never
+            // inherited is not resurrected by any other active block, so its
+            // messages would silently re-enter the prompt with no summary to
+            // replace them — unrecoverable, and invisible without this rollback.
+            const before = [...event.messages]
+            const blocksBefore = snapshotCompressionBlocks(state.compressionBlocks)
+            let filtered: typeof event.messages = event.messages
+            let beforeCount = event.messages.length
+            let compressed = false
+            try {
+                syncCompressionBlocks(state, presentIds, ambiguousKeys)
+                beforeCount = event.messages.length
+                filtered = applyCompressedRanges(
+                    state,
+                    event.messages,
+                    keys,
+                    config.strategies.guardToolPairs !== false,
+                )
+                // MUST stay an in-place splice: the host's trigger yields the
+                // callback's return value nowhere and returns the SAME event
+                // object it passed in, so `event.messages = filtered` would
+                // silently no-op the entire plugin.
+                event.messages.splice(0, event.messages.length, ...filtered)
+                compressed = true
+            } catch (err) {
+                // Unconditional, NOT debug-gated: a swallowed state mutation is
+                // the one failure class in this file that is unrecoverable and
+                // leaves no trace in the request itself — the next request
+                // would just quietly carry an uncompressed prompt. Same class
+                // as the context-limit fallback warning below: if the user
+                // cannot see it, they cannot act on it.
+                console.warn(
+                    "[slim] compression skipped: the apply step threw, so this request is " +
+                        "sent uncompressed and the compression state was rolled back.",
+                    err,
+                )
+                // Best-effort: compression failure should never break the request.
+                // Restored WITHOUT spread: the realistic cause of the throw is
+                // argument-count overflow on a very large array, and a spread
+                // here would throw identically — escaping the context hook,
+                // which is the exact outcome this catch exists to prevent.
+                // Clearing the length first and pushing in a loop cannot.
+                event.messages.length = 0
+                for (const msg of before) event.messages.push(msg)
+                restoreCompressionBlocks(state, blocksBefore)
+                filtered = event.messages
+                beforeCount = filtered.length
+            }
 
             if (config.debug && beforeCount !== filtered.length) {
                 console.log(`[slim] compressed ranges: ${beforeCount} -> ${filtered.length} messages`)
             }
             if (config.debug && ambiguousKeys.size > 0) {
                 console.log(`[slim] ambiguous message keys: ${ambiguousKeys.size} — compression locked for them`)
+            }
+            if (config.debug && compressed && config.strategies.guardToolPairs === false) {
+                console.log(
+                    `[slim] tool-pair guard: DISABLED via strategies.guardToolPairs — a covered ` +
+                        `tool-call whose result survives can now reach the provider as an orphan ` +
+                        `tool_call_id and 400 the next request.`,
+                )
             }
 
             // 2) Pruning strategies (each request).

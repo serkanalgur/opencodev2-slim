@@ -60,6 +60,18 @@ export interface SlimConfig {
             protectedTools: string[]
         }
         /**
+         * Never remove a message that would leave a surviving `role:"tool"`
+         * result without the assistant `tool_calls` part that produced it. The
+         * host repairs the opposite direction (a surviving call with no result)
+         * but not this one, and the orphan reaches the provider as an invalid
+         * request. Applies to BOTH strategies that drop whole messages:
+         * compression-block application and deduplication.
+         *
+         * ON by default. Set it to `false` only as an escape hatch — turning it
+         * off on a range that splits a tool pair restores the 400.
+         */
+        guardToolPairs?: boolean
+        /**
          * DCP pruneOutputs: replace the payload of old, large, non-protected
          * tool results with a placeholder on the outgoing request only.
          *

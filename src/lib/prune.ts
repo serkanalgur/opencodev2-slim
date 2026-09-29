@@ -10,14 +10,26 @@ import type { SlimConfig } from "./types"
 //
 // Hard invariants (violating any of these corrupts the session):
 //
-//   1. NO MESSAGE IS EVER REMOVED. Providers require exactly one tool result
-//      per tool call; dropping a role:"tool" message is a 400 and kills the
-//      session. Only the payload (`result.value` / `state.content`) shrinks.
+//   1. NO MESSAGE IS EVER REMOVED *BY THIS STAGE*. Dropping a role:"tool"
+//      message is a 400 and kills the session. Only the payload
+//      (`result.value` / `state.content`) shrinks. The rule is deliberately
+//      scoped to this stage: other stages (compression blocks, dedup) DO remove
+//      whole messages, which is the entire point of them, and they guard
+//      themselves against invariant 5.
 //   2. NO tool-call part is ever removed — the call/result pairing would break.
 //   3. `result.type` is NEVER changed. Turning a `json` result's value into a
 //      string is a type lie the provider can reject; the value becomes a small
 //      object instead and the type stays `json`.
 //   4. When in doubt, LOCK: leave the output untouched rather than guess.
+//   5. PAIRING INVARIANT (applies to every stage that removes messages): a
+//      surviving role:"tool" result must never lose the assistant tool_calls
+//      part that produced it. The constraint is ONE-DIRECTIONAL, not "one result
+//      per call": the host synthesises a missing result for a surviving call
+//      (`normalizeToolHistory` → "Tool result missing"), but a missing CALL for
+//      a surviving result is not repaired and is emitted as an orphan
+//      `tool_call_id`. So removing a call is allowed exactly when its result is
+//      removed by the same pass (or the result was never there). See
+//      `filterPairSafeIndices` in strategies.ts.
 //
 // ─── Shape (verified, never guessed) ────────────────────────────────────────
 //
