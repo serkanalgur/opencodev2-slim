@@ -79,6 +79,45 @@ export function saveSessionState(state: SessionState, persistenceDir: string): v
     }
 }
 
+/**
+ * Reset the per-request bookkeeping after a compaction rewrote history.
+ *
+ * Called once per new compaction (guarded by `lastCompactionMessageId`) from
+ * the context hook, BEFORE the outgoing request is built. Anything that pointed
+ * into the pre-compaction transcript is now meaningless:
+ *
+ * Reset (stale after compaction):
+ * - `compressionBlocks` — their anchors and covered ids no longer exist;
+ * - the three `nudges` anchor lists — same reason;
+ * - `currentTokenCount` — recomputed from the new prompt on this request;
+ * - `lastAutoCompressTime` — otherwise the first request after compaction is
+ *   immediately eligible for auto-compress;
+ * - `toolCalls` — call ids from the old transcript.
+ *
+ * Preserved (still valid, or user-visible statistics):
+ * - `compressionHistory`, `compressionCount`, `averageCompressionRatio`,
+ *   `lastCompressionTime` — shown on the panel; wiping them is a silent
+ *   regression;
+ * - `modelContextLimit`, `manualMode`, `compressPermission`, `_lastProviderId`,
+ *   `_lastModelId` — configuration/session identity, not transcript state;
+ * - `nextBlockId` — MONOTONIC. Resetting it would re-issue block ids that
+ *   synthetic injected messages already reference, colliding their identities.
+ *
+ * Idempotent: running it again with the same id leaves the same state.
+ */
+export function resetOnCompaction(state: SessionState, compactionMessageId: string): void {
+    state.compressionBlocks = []
+    state.nudges = {
+        contextLimitAnchors: [],
+        turnNudgeAnchors: [],
+        iterationNudgeAnchors: [],
+    }
+    state.currentTokenCount = 0
+    state.lastAutoCompressTime = 0
+    state.toolCalls?.clear?.()
+    state.lastCompactionMessageId = compactionMessageId
+}
+
 export function addCompressionRecord(
     state: SessionState,
     record: CompressionRecord,

@@ -1,5 +1,20 @@
 /** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui"
+import { loadConfig, resolveCompressLimits } from "./lib/config"
+// Reused, not reimplemented (DRY): the request pipeline and the `panel` tool
+// both derive "current prompt size" from the transcript with these helpers, so
+// the TUI surface cannot drift from them.
+import { findLastCompactionIndex, readMeasuredUsage } from "./lib/usage"
+import type { SessionState } from "./lib/types"
+
+/**
+ * The TUI plugin context. It exposes the v2 `client` (an `OpenCodeClient`)
+ * and the local read-only `data` store, but neither a `session` namespace nor
+ * a plugin-level `ctx` — so every session read below goes through
+ * `context.client.session.*`, which is the same v2 surface `ctx.session.*`
+ * resolves to on the main plugin side (see src/index.ts).
+ */
+type PluginContext = Plugin.Context
 
 // Rough token estimate: ~4 chars per token.
 function estimateTokens(text: string): number {
@@ -31,6 +46,13 @@ function emptyStats(): PanelStats {
 }
 
 // Derives context-usage stats from the session transcript.
+//
+// F11: unknown message types (`agent-switched`, `model-switched`,
+// `location-switched`, `idle`, …) are metadata events, not assistant output.
+// They used to fall through to `assistant`, which silently inflated the
+// assistant bucket. The explicit `default` below counts them as `system` so
+// `user + assistant + system` always equals `totalMessages` — skipping them
+// instead would break that invariant.
 export function deriveStats(messages: readonly unknown[]): PanelStats {
     const stats = emptyStats()
     for (const raw of messages) {
@@ -40,19 +62,29 @@ export function deriveStats(messages: readonly unknown[]): PanelStats {
             summary?: string
         }
         let text = ""
-        let role: "user" | "assistant" | "system" = "assistant"
+        let role: "user" | "assistant" | "system"
 
         const t = m?.type
-        if (t === "user" || t === "synthetic" || t === "shell") {
-            role = "user"
-        } else if (t === "assistant") {
-            role = "assistant"
-        } else if (t === "system" || t === "skill") {
-            role = "system"
-        } else if (t === "compaction") {
-            role = "system"
-            stats.compactionCount++
-            text = m.summary || ""
+        switch (t) {
+            case "user":
+            case "synthetic":
+            case "shell":
+                role = "user"
+                break
+            case "assistant":
+                role = "assistant"
+                break
+            case "system":
+            case "skill":
+                role = "system"
+                break
+            case "compaction":
+                role = "system"
+                stats.compactionCount++
+                text = m.summary || ""
+                break
+            default:
+                role = "system"
         }
 
         // User/system messages carry their text on a top-level `text` field
@@ -93,30 +125,126 @@ export function deriveStats(messages: readonly unknown[]): PanelStats {
     return stats
 }
 
-// Builds a human-readable panel as plain text (injected into the message stream).
+// Compression thresholds resolved against the model context window — the same
+// numbers the request pipeline enforces (see resolveCompressLimits).
+interface ResolvedThresholds {
+    max: number
+    min: number
+}
+
+// Mirror of the private `formatTokens` in src/lib/tui.ts. That module owns the
+// `panel` tool renderer and is shared by other agents, so it is duplicated
+// here instead of edited/exported there. Keep both shapes in sync: 150000 →
+// "150.0K", 2000000 → "2.0M", 999 → "999".
+function formatTokens(tokens: number): string {
+    if (tokens >= 1000000) return `${(tokens / 1000000).toFixed(1)}M`
+    if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}K`
+    return String(tokens)
+}
+
+// Resolves the configured compression thresholds (global + per-model
+// overrides) against the measured window, using the exact code path the
+// pipeline uses so the panel never advertises a threshold that will not fire.
+function resolveThresholds(real?: MeasuredReal | null): ResolvedThresholds {
+    const state: SessionState = {
+        sessionId: "",
+        modelContextLimit: real?.contextLimit ?? 0,
+        currentTokenCount: real?.tokens ?? 0,
+        compressionCount: 0,
+        lastCompressionTime: 0,
+        manualMode: false,
+        compressPermission: null,
+        compressionHistory: [],
+        averageCompressionRatio: 0,
+        toolCalls: new Map(),
+    }
+    const config = loadConfig()
+    const providerID = real?.providerID || undefined
+    const modelID = real?.model && real.model !== "unknown" ? real.model : undefined
+    return resolveCompressLimits(config, state, providerID, modelID)
+}
+
+// Same line shape as `renderPanel` in src/lib/tui.ts so the TUI slash panel
+// and the `panel` tool report the trigger identically.
+function renderTriggerLine(thresholds: ResolvedThresholds, contextLimit: number): string {
+    const window =
+        contextLimit > 0
+            ? `${((thresholds.max / contextLimit) * 100).toFixed(1)}% of ${formatTokens(contextLimit)} window`
+            : "window unknown"
+    const floor =
+        contextLimit > 0
+            ? `${formatTokens(thresholds.min)} (${((thresholds.min / contextLimit) * 100).toFixed(1)}%)`
+            : formatTokens(thresholds.min)
+    return `│ Trigger: ${formatTokens(thresholds.max)} tokens (${window}) · floor ${floor}`
+}
+
+// Builds a human-readable panel as plain text. The result is only ever shown
+// to the user (modal/toast) — it is never written into the session transcript.
+//
+// Scope (F4): the numbers come from `client.session.context`, which the v2 API
+// documents as "all messages after the last compaction" — it is NOT the whole
+// session. The `Scope:` line states that up front so `Messages:` and the
+// estimates read as window counts instead of session totals. The `Messages:`
+// label itself is kept verbatim because tests/ asserts on it.
 function renderPanelText(
     sessionID: string,
     stats: PanelStats,
     real?: MeasuredReal | null,
+    thresholds?: ResolvedThresholds | null,
 ): string {
     const limit = real?.contextLimit ?? 0
     const pct = real?.usagePercent ?? 0
     const status = real ? (pct >= 90 ? "critical" : pct >= 70 ? "warning" : "healthy") : "n/a"
+    // F5: README promises the resolved threshold (token count + % of window).
+    const trigger = thresholds ? renderTriggerLine(thresholds, limit) : null
     const lines: string[] = []
     lines.push("┌─────────────────────────────────────────────────────────────┐")
     lines.push("│                    SLIM CONTEXT PANEL                       │")
     lines.push("├─────────────────────────────────────────────────────────────┤")
     lines.push(`│ Session: ${sessionID.slice(0, 40)}`)
+    lines.push(`│ Scope: messages since the last compaction (session.context)`)
     lines.push(`│ Messages: ${stats.totalMessages}`)
     lines.push(
         `│   User: ${stats.userMessages}  Assistant: ${stats.assistantMessages}  System: ${stats.systemMessages}`,
     )
-    lines.push(`│   Tool calls: ${stats.toolCalls}  Compactions: ${stats.compactionCount}`)
+    lines.push(`│   Tool calls: ${stats.toolCalls}  Compactions in scope: ${stats.compactionCount}`)
     lines.push(`│ Tokens (est): User ${stats.tokensByRole.user} | Assistant ${stats.tokensByRole.assistant} | System ${stats.tokensByRole.system}`)
     lines.push(`│ Total token estimate: ${stats.totalTokens}`)
+    if (trigger && !real) lines.push(trigger)
     if (real) {
         lines.push("├─────────────────────────────────────────────────────────────┤")
-        lines.push(`│ Measured tokens: ${real.tokens}  (${pct}% of ${limit})  [${status}]`)
+        // Two different quantities, never mixed (mirrors `renderPanel` in
+        // src/lib/tui.ts): Context = the current prompt size, Lifetime = the
+        // session's cumulative spend.
+        const hasPrompt = real.promptTokens !== undefined && real.promptTokens !== null
+        if (hasPrompt) {
+            // Context = the last request's `input + cache.read + cache.write`
+            // (readMeasuredUsage), i.e. exactly what the `panel` tool shows as
+            // Context. NEVER the lifetime counter — that is what produced the
+            // misleading "56.1M (100% of 200000)" this line used to print.
+            lines.push(
+                `│ Context: ${formatTokens(real.promptTokens as number)} / ${formatTokens(limit)} (${pct}%)  [${status}]`,
+            )
+            // Lifetime spend is only shown when it actually differs (cumulative
+            // is always >= the prompt size) and is labelled explicitly so it is
+            // never read as occupancy. Same wording as the `panel` tool.
+            if (real.tokens > (real.promptTokens as number)) {
+                lines.push(
+                    `│ Lifetime: ${formatTokens(real.tokens)} tokens (cumulative spend, NOT context size)`,
+                )
+            }
+        } else {
+            // No per-turn usage in the transcript, so the only figure available
+            // is Session.Info.tokens' LIFETIME cumulative counter. It is spend,
+            // not occupancy: keep the legacy line for compatibility but qualify
+            // it immediately with a warning so it cannot be mistaken for window
+            // fill.
+            lines.push(`│ Measured tokens: ${real.tokens}  (${pct}% of ${limit})  [${status}]`)
+            lines.push(
+                `│ Lifetime cumulative — NOT context size (no per-turn usage in transcript)`,
+            )
+        }
+        if (trigger) lines.push(trigger)
         if (real.cost > 0) lines.push(`│ Cost: $${real.cost.toFixed(6)}`)
         lines.push(`│ Model: ${real.model}`)
     }
@@ -125,7 +253,7 @@ function renderPanelText(
 }
 
 // Resolves the "current" session: the router-focused session if any, else the most recent.
-function resolveCurrentSession(context: any): string | null {
+function resolveCurrentSession(context: PluginContext): string | null {
     const sessions = context.data.session.list() || []
     if (sessions.length === 0) return null
     // The TUI host exposes the active route via context.ui.router (not context.router).
@@ -139,19 +267,46 @@ function resolveCurrentSession(context: any): string | null {
 // Server-measured context numbers for a session (Session.Info.tokens + cost + model),
 // mirroring what the `panel` tool in index.ts reads via ctx.session.get().
 interface MeasuredReal {
+    /**
+     * LIFETIME CUMULATIVE token counter (Session.Info.tokens summed across every
+     * usage event). `cache.read` re-reads the whole context each turn, so this
+     * grows without bound (opencode #30649: 56.1M in one session). Valid as a
+     * COST statistic, never as "how full is the window".
+     */
     tokens: number
+    /**
+     * CURRENT PROMPT SIZE for the last completed request:
+     * `input + cache.read + cache.write`, read from the transcript via
+     * `readMeasuredUsage` (src/lib/usage.ts) — the same figure the `panel` tool
+     * shows as `Context`. Optional: only a transcript carrying per-message token
+     * info provides it; when absent the panel degrades to `tokens`, labelled as
+     * the cumulative counter so it is never read as occupancy.
+     */
+    promptTokens?: number
     cost: number
     contextLimit: number
     model: string
+    /** Provider id of the selected model — needed for per-model threshold overrides. */
+    providerID: string
     usagePercent: number
 }
 
-async function measureSession(context: any, sessionID: string): Promise<MeasuredReal | null> {
+async function measureSession(
+    context: PluginContext,
+    sessionID: string,
+    messages?: readonly unknown[],
+): Promise<MeasuredReal | null> {
     try {
+        // v2 session read, same call shape as `ctx.session.get({ sessionID })`
+        // in src/index.ts. Read-only: never mutates the session.
         const info: any = await context.client.session.get({ sessionID })
         if (!info) return null
         const tokens: any = info.tokens ?? {}
-        const tokenCount =
+        // ⚠️ `info.tokens` is the session's LIFETIME CUMULATIVE counter: the v2
+        // projector adds input/output/reasoning/cache.read/cache.write on every
+        // usage event, and cache.read re-reads the whole context each turn, so
+        // this sum grows without bound. It measures spend, NOT window fill.
+        const lifetimeTokens =
             (typeof tokens.input === "number" ? tokens.input : 0) +
             (typeof tokens.output === "number" ? tokens.output : 0) +
             (typeof tokens.reasoning === "number" ? tokens.reasoning : 0) +
@@ -182,13 +337,32 @@ async function measureSession(context: any, sessionID: string): Promise<Measured
             contextLimit = info.model.limit.context
         }
 
+        // Current prompt size: the last completed assistant turn's `tokens`
+        // (`input + cache.read + cache.write`), derived with the SAME helpers
+        // the request pipeline and the `panel` tool use (src/lib/usage.ts).
+        // `afterIndex` is the last COMPLETED compaction — usage recorded before
+        // it describes a prompt that no longer exists. Available only when the
+        // caller hands us the transcript (the /panel, /status and /compress
+        // commands all do); otherwise the panel degrades to the lifetime
+        // counter and says so.
+        let promptTokens: number | undefined
+        if (messages) {
+            const usage = readMeasuredUsage(messages, findLastCompactionIndex(messages))
+            if (usage) promptTokens = usage.promptTokens
+        }
+
+        // Occupancy is the prompt size when we have it; the cumulative counter is
+        // only ever a fallback, never the headline.
+        const contextTokens = promptTokens ?? lifetimeTokens
         const usagePercent =
-            contextLimit > 0 ? Math.min(100, Math.round((tokenCount / contextLimit) * 100)) : 0
+            contextLimit > 0 ? Math.min(100, Math.round((contextTokens / contextLimit) * 100)) : 0
         return {
-            tokens: tokenCount,
+            tokens: lifetimeTokens,
+            promptTokens,
             cost: typeof info.cost === "number" ? info.cost : 0,
             contextLimit,
             model: modelID || "unknown",
+            providerID,
             usagePercent,
         }
     } catch {
@@ -234,16 +408,48 @@ export default Plugin.define({
                                 }
 
                                 try {
-                                    await context.data.session.message.sync(sessionID)
-                                    const messages =
-                                        context.data.session.message.list(sessionID) || []
-                                    const real = await measureSession(context, sessionID)
-                                    const stats = deriveStats(messages)
-                                    const text = renderPanelText(sessionID, stats, real)
-                                    await context.client.session.synthetic({
+                                    // Read-only v2 reads: transcript via the v2
+                                    // session API (no local-store sync) and token
+                                    // usage via session.get. Nothing is written
+                                    // back to the session.
+                                    //
+                                    // F4 decision — stay on session.context rather than
+                                    // message.list: this endpoint is officially "all
+                                    // messages after the last compaction", i.e. exactly
+                                    // the active context a context panel should describe,
+                                    // so the honest fix is scoping the labels (see
+                                    // renderPanelText) instead of swapping the source.
+                                    // message.list also returns MessageWithParts
+                                    // (info + parts), a different shape than the
+                                    // SessionMessageInfo deriveStats consumes, so it
+                                    // would need an adapter and would re-introduce
+                                    // messages compaction already dropped.
+                                    const messages = await context.client.session.context({
                                         sessionID,
-                                        text,
-                                        description: "slim-panel",
+                                    })
+                                    // Hand the transcript to measureSession so it can
+                                    // derive the current PROMPT size (Context) instead
+                                    // of showing the lifetime cumulative counter.
+                                    const real = await measureSession(
+                                        context,
+                                        sessionID,
+                                        messages ?? [],
+                                    )
+                                    const stats = deriveStats(messages ?? [])
+                                    const thresholds = resolveThresholds(real)
+                                    const text = renderPanelText(
+                                        sessionID,
+                                        stats,
+                                        real,
+                                        thresholds,
+                                    )
+
+                                    // The panel is long-form, so it goes to a modal
+                                    // instead of a toast — and never into the
+                                    // session transcript.
+                                    await context.ui.dialog.alert({
+                                        title: "Slim Context Panel",
+                                        message: text,
                                     })
                                 } catch (e) {
                                     context.ui.toast.show({
@@ -306,11 +512,34 @@ export default Plugin.define({
                                     const mode = args.mode || "auto"
                                     const keepRecent = args.keepRecent ?? 5
 
-                                    // Measure current state first
-                                    const real = await measureSession(context, sessionID)
+                                    // Measure current state first. Read the transcript
+                                    // too so the "Current state" line reports the
+                                    // current PROMPT size (Context) — the same
+                                    // semantics /panel and the `panel` tool use —
+                                    // rather than the lifetime cumulative counter.
+                                    let messages: unknown[] = []
+                                    try {
+                                        messages =
+                                            (await context.client.session.context({
+                                                sessionID,
+                                            })) ?? []
+                                    } catch {
+                                        // Transcript unavailable: fall back to the
+                                        // lifetime counter, labelled as cumulative.
+                                    }
+                                    const real = await measureSession(
+                                        context,
+                                        sessionID,
+                                        messages,
+                                    )
 
+                                    const hasPrompt =
+                                        real?.promptTokens !== undefined &&
+                                        real?.promptTokens !== null
                                     const statusLine = real
-                                        ? `${real.tokens.toLocaleString()} tokens (${real.usagePercent}% of ${real.contextLimit.toLocaleString()})`
+                                        ? hasPrompt
+                                            ? `Context ${real.promptTokens!.toLocaleString()} tokens (${real.usagePercent}% of ${real.contextLimit.toLocaleString()}) · Lifetime ${real.tokens.toLocaleString()} tokens (cumulative spend, NOT context size)`
+                                            : `${real.tokens.toLocaleString()} tokens (${real.usagePercent}% of ${real.contextLimit.toLocaleString()}) — lifetime cumulative, NOT context size`
                                         : "unknown"
 
                                     const text = [
@@ -327,10 +556,27 @@ export default Plugin.define({
                                         `> Or type: \`compress({ focus: "${focus}", mode: "${mode}", keepRecent: ${keepRecent} })\``,
                                     ].join("\n")
 
+                                    // ── /compress delivery decision ─────────────────────────
+                                    // This command is guidance for the model ("the assistant
+                                    // will now call the compress tool"), so writing it into the
+                                    // transcript is intentional — unlike /status and /slim-debug,
+                                    // which only report state. `delivery` is stated explicitly
+                                    // because the server would otherwise silently default it:
+                                    //   - "steer" (chosen): the item is delivered immediately,
+                                    //     interrupting an in-flight turn if one is running, and
+                                    //     `Session.synthetic` wakes an idle session (resume stays
+                                    //     at its default true). It matches the server default
+                                    //     (`delivery ?? "steer"`) and the TUI's own prompt
+                                    //     default, so /compress behaves like typing a message.
+                                    //   - "queue" (rejected): SessionRunner.drain stops before a
+                                    //     queued item while a turn is active, so the compress
+                                    //     instruction would wait for the next user turn — the
+                                    //     opposite of "compress now".
                                     await context.client.session.synthetic({
                                         sessionID,
                                         text,
                                         description: "slim-compress",
+                                        delivery: "steer",
                                     })
 
                                     context.ui.toast.show({
@@ -375,7 +621,25 @@ export default Plugin.define({
                                 }
 
                                 try {
-                                    const real = await measureSession(context, sessionID)
+                                    // Read the transcript so the report can show the
+                                    // current PROMPT size (Context) rather than the
+                                    // lifetime cumulative counter — consistent with
+                                    // /panel and the `panel` tool.
+                                    let messages: unknown[] = []
+                                    try {
+                                        messages =
+                                            (await context.client.session.context({
+                                                sessionID,
+                                            })) ?? []
+                                    } catch {
+                                        // Transcript unavailable: fall back to the
+                                        // lifetime counter, labelled as cumulative.
+                                    }
+                                    const real = await measureSession(
+                                        context,
+                                        sessionID,
+                                        messages,
+                                    )
                                     if (!real) {
                                         context.ui.toast.show({
                                             title: "Slim Status",
@@ -392,19 +656,41 @@ export default Plugin.define({
                                               ? "🟡 WARNING"
                                               : "🟢 HEALTHY"
 
+                                    const hasPrompt =
+                                        real.promptTokens !== undefined &&
+                                        real.promptTokens !== null
+                                    // Context = prompt, Lifetime = cumulative spend.
+                                    // The no-prompt fallback keeps the `**Usage:**`
+                                    // label callers/tests key on, but explicitly
+                                    // qualifies the number as lifetime cumulative.
+                                    const usageLines = hasPrompt
+                                        ? [
+                                              `**Context:** ${real.promptTokens!.toLocaleString()} / ${real.contextLimit.toLocaleString()} tokens (${real.usagePercent}%)`,
+                                              ...(real.tokens > real.promptTokens!
+                                                  ? [
+                                                        `**Lifetime:** ${real.tokens.toLocaleString()} tokens (cumulative spend, NOT context size)`,
+                                                    ]
+                                                  : []),
+                                          ]
+                                        : [
+                                              `**Usage:** ${real.tokens.toLocaleString()} / ${real.contextLimit.toLocaleString()} tokens (${real.usagePercent}%) — lifetime cumulative, NOT context size`,
+                                          ]
+
                                     const text = [
                                         `**Context Status:** ${status}`,
-                                        `**Usage:** ${real.tokens.toLocaleString()} / ${real.contextLimit.toLocaleString()} tokens (${real.usagePercent}%)`,
+                                        ...usageLines,
                                         `**Model:** ${real.model}`,
                                         real.cost > 0 ? `**Cost:** $${real.cost.toFixed(4)}` : "",
                                     ]
                                         .filter(Boolean)
                                         .join("\n")
 
-                                    await context.client.session.synthetic({
-                                        sessionID,
-                                        text,
-                                        description: "slim-status",
+                                    // Read-only report: shown in a dialog like /panel and
+                                    // deliberately never written to the session transcript
+                                    // (no client.session.synthetic here).
+                                    await context.ui.dialog.alert({
+                                        title: "Slim Status",
+                                        message: text,
                                     })
                                 } catch (e) {
                                     context.ui.toast.show({
@@ -475,10 +761,12 @@ export default Plugin.define({
 
                                     const text = `**Slim Debug Mode:** ${debug ? "ON 🔴" : "OFF ⚪"}\n\nDebug logs will ${debug ? "now" : "no longer"} appear in the console.`
 
-                                    await context.client.session.synthetic({
-                                        sessionID,
-                                        text,
-                                        description: "slim-debug",
+                                    // Toggle result is reported to the user only — the config
+                                    // file above is the single side effect, the session transcript
+                                    // is never appended to.
+                                    await context.ui.dialog.alert({
+                                        title: "Slim Debug",
+                                        message: text,
                                     })
                                 } catch (e) {
                                     context.ui.toast.show({

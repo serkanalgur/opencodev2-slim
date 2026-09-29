@@ -85,26 +85,88 @@ export function getMessageText(msg: MessageWithParts): string {
     return texts.join("\n")
 }
 
+/**
+ * Extract printable text out of a tool result payload.
+ *
+ * v2 does NOT hand back a string: a completed tool result is a content BLOCK
+ * array (`SessionMessageToolStateCompleted.content`,
+ * `ToolResultValue.content`) shaped `{ type: "text", text } | { type: "file",
+ * uri, mime, name }`. Calling `String()` on that array produces
+ * `"[object Object],[object Object]"` — the extraction silently destroyed the
+ * very text it is supposed to measure, so token accounting was built on
+ * garbage.
+ *
+ * Handling:
+ * - string (v1 `state.output`, `text`/`json`/`error` values) → verbatim;
+ * - content block array → `text` blocks joined; `file` blocks carry no prompt
+ *   text (uri/mime/name only) and are skipped; a data-URI `data` field is kept;
+ * - any other object → JSON, which is how it reaches the API anyway.
+ */
+export function extractToolResultText(value: unknown): string {
+    if (value === null || value === undefined) return ""
+    if (typeof value === "string") return value
+
+    if (Array.isArray(value)) {
+        const texts: string[] = []
+        for (const block of value) {
+            if (block !== null && typeof block === "object") {
+                const record = block as Record<string, unknown>
+                if (record.type === "text" && typeof record.text === "string") {
+                    texts.push(record.text)
+                    continue
+                }
+                if (record.type === "file") continue
+                if (typeof record.data === "string") {
+                    texts.push(record.data)
+                    continue
+                }
+                const json = JSON.stringify(record)
+                if (json) texts.push(json)
+                continue
+            }
+            texts.push(String(block))
+        }
+        return texts.join("\n")
+    }
+
+    if (typeof value === "object") {
+        const json = JSON.stringify(value)
+        // JSON.stringify only fails on cycles; fall back rather than drop the field.
+        return json ?? String(value)
+    }
+    return String(value)
+}
+
 export function getToolResultContent(msg: MessageWithParts): string {
     const results: string[] = []
+
+    // The 500-char cap per result is deliberate: this text feeds the
+    // compression candidate scan, where a 300k-token grep dump must not drown
+    // out the rest of the message. Extract the real text FIRST, then truncate
+    // — truncating a `String()`-ified block array would cut into
+    // "[object Object]" and keep none of the payload.
+    const push = (value: unknown): void => {
+        const text = extractToolResultText(value)
+        if (text) results.push(text.slice(0, 500))
+    }
 
     for (const part of msg.parts) {
         // v1 SDK format: type === "tool"
         if (part.type === "tool" && part.state?.type === "result" && part.state?.output) {
-            results.push(String(part.state.output).slice(0, 500))
+            push(part.state.output)
         }
         // v2 AI format: type === "tool-result"
         if (part.type === "tool-result" && part.result) {
             const val = part.result.value
             if (val !== undefined && val !== null) {
-                results.push(String(val).slice(0, 500))
+                push(val)
             }
         }
         // SessionMessageInfo format: tool with state.status === "completed"
         if (part.type === "tool" && part.state?.status === "completed") {
             const output = part.state.content ?? part.state.output
             if (output !== undefined && output !== null) {
-                results.push(String(output).slice(0, 500))
+                push(output)
             }
         }
     }
