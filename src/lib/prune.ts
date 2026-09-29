@@ -1,4 +1,5 @@
 import type { SlimConfig } from "./types"
+import { pairingIdOf } from "./strategies"
 
 // ─── Tool-output pruning (DCP pruneOutputs) ─────────────────────────────────
 //
@@ -206,9 +207,17 @@ function computeTurnIndices(messages: readonly any[]): number[] {
     return indices
 }
 
+/**
+ * The call key for a tool part — deliberately the SAME precedence as
+ * `pairingIdOf` in ../strategies.ts, and it delegates to it rather than
+ * re-deriving the rule. A local `part?.id ?? part?.toolCallID ?? part?.callID`
+ * would be the one site in the tree that reads `id` first, which is wrong for
+ * the v1 split shape: there `id` is the PART id and differs between the
+ * assistant-side call and the tool-side result, so a result would never match
+ * its call and its output would never be replaced.
+ */
 function callIdOf(part: any): string | undefined {
-    const id = part?.id ?? part?.toolCallID ?? part?.callID
-    return typeof id === "string" && id.length > 0 ? id : undefined
+    return pairingIdOf(part)
 }
 
 function startsWithMarker(value: unknown): boolean {
@@ -389,7 +398,13 @@ function candidateFromResult(
     const result = part.result
     if (!result || typeof result !== "object") return null
 
-    if (result.type === "error") return null // purgeStaleToolErrors owns errors
+    // An errored result is locked regardless of whether any other strategy is
+    // running. The lock is not about ownership: a failure's output is the ONLY
+    // record of what went wrong, and rewriting it to a placeholder destroys
+    // that record permanently — the next request (and the next attempt) would
+    // see a successful-looking result. This holds whether or not
+    // `strategies.purgeErrors` is enabled, and it is not up for negotiation.
+    if (result.type === "error") return null
     if (result.type === "text") {
         if (startsWithMarker(result.value)) return null
         return makeCandidate(callID, tool, ctx, result.value, "text")

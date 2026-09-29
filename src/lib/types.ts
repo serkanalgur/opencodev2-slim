@@ -54,6 +54,21 @@ export interface SlimConfig {
             enabled: boolean
             protectedTools: string[]
         }
+        /**
+         * DCP purge-errors: replace the large string values in the `input` of a
+         * tool call whose result errored, once the call is at least `turns`
+         * positions behind the end of the conversation. The error itself is
+         * preserved; only the input payload is rewritten.
+         *
+         * **OFF by default** (`enabled: false`). It previously defaulted to
+         * `true` but was BROKEN, not disabled: the id lookup read only
+         * `toolCallID`/`callID`, and on the v2 message shape the id lives on
+         * `part.id`, so the strategy could never pair an errored result with
+         * its call and did nothing on any request. The lookup now goes through
+         * `pairingIdOf`, so the feature works when you turn it on — and because
+         * it rewrites what goes on the wire, enabling it is an explicit choice
+         * rather than an inherited one.
+         */
         purgeErrors: {
             enabled: boolean
             turns: number

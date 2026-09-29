@@ -280,10 +280,16 @@ export async function buildPanelData(
     // Compression stats
     const compressionCount = state.compressionCount
     const averageRatio = state.averageCompressionRatio
+    // A compression whose summary is LARGER than the range it replaces saved
+    // nothing — it cost. Summing the raw signed delta would let one such record
+    // drive "Tokens saved" negative, and `costSaved` is derived from this sum,
+    // so the panel would print a negative dollar saving. Only the non-negative
+    // per-record deltas are counted, which keeps this consistent with the
+    // clamped `ratio` those same records are stored with.
     let totalTokensSaved = 0
     for (const record of state.compressionHistory) {
         if (record.success) {
-            totalTokensSaved += record.inputTokens - record.outputTokens
+            totalTokensSaved += Math.max(0, record.inputTokens - record.outputTokens)
         }
     }
     const lastCompression = state.compressionHistory.length > 0
@@ -563,12 +569,43 @@ export function renderPanel(data: PanelData): string {
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-function formatTokens(tokens: number): string {
-    if (tokens >= 1000000) {
-        return `${(tokens / 1000000).toFixed(1)}M`
-    }
-    if (tokens >= 1000) {
-        return `${(tokens / 1000).toFixed(1)}K`
+// The single source of truth for token magnitudes — the TUI surface imports
+// this (src/tui.tsx) rather than mirroring it, so the two cannot drift.
+//
+// Units step every 1e3 (K, M, G, T) so the mantissa never reaches the
+// thousands and a large value can never render as a 10-character string.
+// MAX_SAFE_INTEGER (9.007e15) renders "9007.2T" — exactly 7 chars.
+//
+// Scope of that budget: it is derived from the LIFETIME line alone, which has 56
+// columns of fixed text in a 63-column frame, leaving 7 for the number. It is
+// NOT a universal guarantee for every line in the panel — the Trigger and Prune
+// lines carry far less fixed text and can absorb a wider number. Those overflow
+// their frame at entirely ordinary values and are a separate, pre-existing
+// defect; the `ALLOWED_OVERFLOW` width test does not catch them because it
+// never drives `renderPanel` with a prune field. The comment records the
+// reasoning it actually supports rather than a claim about the whole panel.
+//
+// One decimal at every tier, kept deliberately: "150.0K", "200.0K",
+// "800.0K" and "1.0M" are asserted verbatim in the test suite, and the
+// trailing `.0` is what distinguishes a rounded figure from a count. Numbers
+// below 1000 are printed exactly, not as "999.0".
+//
+// Non-finite input is left as-is (NaN → "NaN", Infinity → "InfinityT"): no
+// caller can produce it — every value here comes from a server usage report or
+// a transcript count — and the rendered width matches the previous behaviour,
+// so hardening it would be an unrequested change.
+const TOKEN_UNITS: ReadonlyArray<readonly [number, string]> = [
+    [1e12, "T"],
+    [1e9, "G"],
+    [1e6, "M"],
+    [1e3, "K"],
+]
+
+export function formatTokens(tokens: number): string {
+    for (const [scale, suffix] of TOKEN_UNITS) {
+        if (tokens >= scale) {
+            return `${(tokens / scale).toFixed(1)}${suffix}`
+        }
     }
     return String(tokens)
 }

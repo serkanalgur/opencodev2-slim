@@ -34,7 +34,14 @@ const DEFAULT_CONFIG: SlimConfig = {
             protectedTools: [],
         },
         purgeErrors: {
-            enabled: true,
+            // OFF by default, and it was not a matter of taste: until the id
+            // lookup was fixed this read only `toolCallID`/`callID`, which do
+            // not exist on the v2 hook part (`id` is the id there), so the
+            // strategy could never match a call to its errored result and did
+            // nothing on every request. It now works, but it rewrites the
+            // `input` of errored tool calls, so it stays opt-in rather than
+            // changing every existing user's prompt in a patch release.
+            enabled: false,
             turns: 4,
             protectedTools: [],
         },

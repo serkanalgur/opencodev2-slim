@@ -5,6 +5,10 @@ import { loadConfig, resolveCompressLimits } from "./lib/config"
 // both derive "current prompt size" from the transcript with these helpers, so
 // the TUI surface cannot drift from them.
 import { findLastCompactionIndex, readMeasuredUsage } from "./lib/usage"
+// Shared formatter, not a mirrored copy: src/lib/tui.ts owns the `panel` tool
+// renderer and is already on this module's dependency graph's leaf side (it
+// imports nothing from src/tui.tsx), so importing it here adds no cycle.
+import { formatTokens } from "./lib/tui"
 import type { SessionState } from "./lib/types"
 import { PLUGIN_VERSION } from "./lib/version"
 
@@ -131,16 +135,6 @@ export function deriveStats(messages: readonly unknown[]): PanelStats {
 interface ResolvedThresholds {
     max: number
     min: number
-}
-
-// Mirror of the private `formatTokens` in src/lib/tui.ts. That module owns the
-// `panel` tool renderer and is shared by other agents, so it is duplicated
-// here instead of edited/exported there. Keep both shapes in sync: 150000 →
-// "150.0K", 2000000 → "2.0M", 999 → "999".
-function formatTokens(tokens: number): string {
-    if (tokens >= 1000000) return `${(tokens / 1000000).toFixed(1)}M`
-    if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}K`
-    return String(tokens)
 }
 
 // Resolves the configured compression thresholds (global + per-model

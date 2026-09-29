@@ -252,28 +252,57 @@ function contentPartsOf(message: any): any[] {
     return Array.isArray(content) ? content : []
 }
 
-/** True for a part that PRODUCES a call (the side that must be protected). */
+/**
+ * True for a part that PRODUCES a call (the side that must be protected).
+ *
+ * Deliberately NARROW: only the v2 hook shape's `tool-call`. The v1 transcript
+ * shape represents BOTH sides as `{ type: "tool" }` and is only distinguished by
+ * `state` (a call carries `state.input`, a result carries `state.output` /
+ * `state.status`) — `purgeStaleToolErrors` reads that shape, this guard does
+ * not. See the note on `purgeStaleToolErrors` for why the asymmetry is kept
+ * rather than resolved: the guard is load-bearing for session safety, and a
+ * half-modelled shape must not be allowed to fire it.
+ */
 function isCallPart(part: any): boolean {
     return part?.type === "tool-call"
 }
 
-/** True for a part that ANSWERS a call (the side the host can synthesise). */
+/**
+ * True for a part that ANSWERS a call (the side the host can synthesise).
+ *
+ * Wider than `isCallPart` on purpose: `"tool"` is accepted here because a
+ * `role:"tool"` result is unambiguously the answer side, and mis-recognising it
+ * as removable would be the fatal direction. The converse — widening
+ * `isCallPart` to `"tool"` — cannot make the same claim, which is exactly why
+ * it was not done.
+ */
 function isResultPart(part: any): boolean {
     return part?.type === "tool-result" || part?.type === "tool"
 }
 
 /**
- * The in-hook pairing id of a tool part: the `tool-call` part's `id` and the
- * `tool-result` part's `id` are the same string on the v2 Message shape. The
- * legacy transcript shape carries it as `callID` instead. Never the lowered /
+ * The in-hook pairing id of a tool part. On the v2 Message shape the
+ * `tool-call` and `tool-result` parts share one `id`. On the legacy transcript
+ * shape the shared value is `callID`/`toolCallID`, and `id` is the PART id —
+ * which differs between the two sides of a split pair — so the legacy key must
+ * be read first. Never the lowered /
  * provider-facing id: `protocols/openai-chat.js` rewrites ids on the way out
  * (Mistral truncates to 9 chars, OpenAI to 40, Claude sanitises), so only the
  * in-request id can be compared.
  */
-function pairingIdOf(part: any): string | undefined {
+export function pairingIdOf(part: any): string | undefined {
+    // The legacy key wins when present. On the v1 ToolPart shape a part carries
+    // BOTH `id` (the PART id, `prt_*`) and `callID` (the CALL id), and the two
+    // DIFFER between the two sides of a pair, because the call lives in the
+    // assistant message and the result in a separate `role:"tool"` message.
+    // Reading `id` first returns `prt_CALL` for one side and `prt_RES` for the
+    // other, so the two never match and a v1 split pair is never purged.
+    // The v2 Message shape has no `callID` at all, so it falls through to
+    // `id` — which IS the pairing id there.
+    const legacy = part?.toolCallID ?? part?.callID
+    if (typeof legacy === "string" && legacy.length > 0) return legacy
     if (typeof part?.id === "string" && part.id.length > 0) return part.id
-    const callId = part?.toolCallID ?? part?.callID
-    return typeof callId === "string" && callId.length > 0 ? callId : undefined
+    return undefined
 }
 
 /**
@@ -775,6 +804,51 @@ export async function buildCompressionSummary(
     return lines.join("\n")
 }
 
+// Bounds on the "### Protected Tool Outputs" section of a compression summary.
+//
+// This is the only section of `buildCompressionSummary` that can be arbitrarily
+// large: each entry carries up to 1000 chars of input PLUS up to 2000 chars of
+// output, and both the entry count and the per-entry sizes are set by the
+// transcript, not by the caller. Uncapped, a `todoread`-heavy range summarised
+// at ~4x the size of the range it replaces — a net context INCREASE on the
+// default path, in a plugin whose purpose is context reduction, and unlike the
+// purge change it is not gated behind any feature flag.
+//
+// Two bounds, because either alone is insufficient:
+//
+//   - MAX_LINES bounds the entry COUNT. Without it a 200-pair range emits 200
+//     entries, and the count alone dominates the summary.
+//   - MAX_SECTION_CHARS bounds the whole section's LENGTH. A count cap cannot
+//     help on its own: a single 2000-char output is 100x a header line, so 5
+//     entries can already exceed any reasonable per-section budget. The budget
+//     is what actually keeps the section smaller than what it replaces.
+//
+// Values: 20 lines and 8000 chars. 20 entries covers a realistic batch of
+// `todowrite`/`task` calls in one range while staying in line with the siblings
+// (Tool Calls 10, Errors 5, Decisions 5 — protected tools get the largest
+// share precisely because their content is the most expensive to lose). 8000
+// chars is ~2k tokens: a fraction of any range worth compressing, so the summary
+// stays a summary. A per-entry output slice is ALSO applied (see
+// PROTECTED_OUTPUT_SLICE) so a single fat entry cannot eat the entire budget
+// and starve the rest.
+const PROTECTED_OUTPUT_MAX_LINES = 20
+const PROTECTED_OUTPUT_MAX_CHARS = 8000
+
+/** Per-entry output slice, so one fat entry cannot monopolise the budget. */
+const PROTECTED_OUTPUT_SLICE = 2000
+
+/** Per-entry input slice, matching the 1000 the pre-cap code used. */
+const PROTECTED_INPUT_SLICE = 1000
+
+/**
+ * Collects the "### Protected Tool Outputs" body: the input (and, where the
+ * call is paired, the output) of every protected tool call in `messages`.
+ *
+ * Bounded by PROTECTED_OUTPUT_MAX_LINES and PROTECTED_OUTPUT_MAX_CHARS. When
+ * either bound truncates, a visible `… N more omitted` line is appended: a user
+ * reading a summary must be able to tell it is partial, otherwise a silently
+ * truncated section reads as a complete record of what was preserved.
+ */
 function collectProtectedToolOutputs(
     messages: MessageWithParts[],
     protectedTools: string[],
@@ -785,7 +859,7 @@ function collectProtectedToolOutputs(
     for (const msg of messages) {
         for (const part of msg.parts) {
             if (part.type !== "tool-result") continue
-            const callId = part.toolCallID ?? part.callID
+            const callId = pairingIdOf(part)
             if (!callId) continue
             const val = part.result?.value ?? part.result
             if (val !== undefined && val !== null && part.result?.type !== "error") {
@@ -794,23 +868,42 @@ function collectProtectedToolOutputs(
         }
     }
 
-    const output: string[] = []
+    const entries: string[] = []
+    let totalChars = 0
+    let omitted = 0
+
     for (const msg of messages) {
         for (const part of msg.parts) {
             if (part.type !== "tool-call") continue
             const name = part.name
             if (!name || !protectedTools.includes(name)) continue
-            const input = JSON.stringify(part.input ?? {}).slice(0, 1000)
-            const callId = part.toolCallID ?? part.callID
+
+            // Count every protected entry so the omission notice is honest, even
+            // the ones past the line cap or over the character budget.
+            if (entries.length >= PROTECTED_OUTPUT_MAX_LINES) {
+                omitted++
+                continue
+            }
+            const input = JSON.stringify(part.input ?? {}).slice(0, PROTECTED_INPUT_SLICE)
+            const callId = pairingIdOf(part)
             const result = callId ? resultsByCallId.get(String(callId)) : undefined
-            output.push(
-                result
-                    ? `- [${name}] input: ${input}\n  output: ${result.slice(0, 2000)}`
-                    : `- [${name}] input: ${input}`,
-            )
+            const entry = result
+                ? `- [${name}] input: ${input}\n  output: ${result.slice(0, PROTECTED_OUTPUT_SLICE)}`
+                : `- [${name}] input: ${input}`
+
+            if (totalChars + entry.length > PROTECTED_OUTPUT_MAX_CHARS) {
+                omitted++
+                continue
+            }
+            entries.push(entry)
+            totalChars += entry.length + 1
         }
     }
-    return output.join("\n")
+
+    if (omitted > 0) {
+        entries.push(`… ${omitted} more protected tool ${omitted === 1 ? "output" : "outputs"} omitted (section capped)`)
+    }
+    return entries.join("\n")
 }
 
 // ─── Pruning: dedup + purge errored tool inputs ────────────────────────────
@@ -863,6 +956,23 @@ export function applyDeduplication(
  * of the conversation. Error messages themselves are preserved.
  * Handles both hook format (content with tool-call/tool-result parts) and
  * SessionMessageInfo format (content with tool parts).
+ *
+ * "Format 2" below classifies a `role:"assistant"` `{ type:"tool",
+ * state:{ input } }` part as a CALL, while `isCallPart` (used by the tool-pair
+ * guard) matches only `type === "tool-call"`. That asymmetry is deliberate and
+ * must not be "fixed" by widening the predicate: this function only rewrites
+ * payload strings and is driven by the host hook, whereas the guard decides
+ * whether a whole message may be removed and cannot fully model the v1
+ * transcript shape. Widening the guard would make it fire on shapes it does not
+ * understand, and a false positive there orphans a tool pair — a 400 on the next
+ * request. `isResultPart` is wider than `isCallPart` on purpose and is not the
+ * same disagreement.
+ *
+ * The pairing id is read through `pairingIdOf`, so the v2 shape (where the id is
+ * `part.id`) resolves. It did not before: every site here read only
+ * `toolCallID`/`callID`, which do not exist on the v2 hook parts, so this
+ * function was inert in production. The `enabled` default was flipped to
+ * `false` for that reason — see `SlimConfig.strategies.purgeErrors`.
  */
 export function purgeStaleToolErrors(messages: any[], turns: number): void {
     const n = messages.length
@@ -878,13 +988,13 @@ export function purgeStaleToolErrors(messages: any[], turns: number): void {
             // Format 1: tool-result with result.type === "error"
             if (part?.type === "tool-result") {
                 if (part.result?.type === "error") {
-                    const callId = part.toolCallID ?? part.callID
+                    const callId = pairingIdOf(part)
                     if (callId) erroredCallIds.add(String(callId))
                 }
             }
             // Format 2: tool with state.status === "error"
             if (part?.type === "tool" && part?.state?.status === "error") {
-                const callId = part.callID
+                const callId = pairingIdOf(part)
                 if (callId) erroredCallIds.add(String(callId))
             }
         }
@@ -901,7 +1011,7 @@ export function purgeStaleToolErrors(messages: any[], turns: number): void {
         for (const part of contentArr) {
             // Format 1: tool-call part
             if (part?.type === "tool-call") {
-                const callId = part.toolCallID ?? part.callID
+                const callId = pairingIdOf(part)
                 if (!callId || !erroredCallIds.has(String(callId))) continue
                 const input = part.input
                 if (input && typeof input === "object") {
@@ -914,7 +1024,7 @@ export function purgeStaleToolErrors(messages: any[], turns: number): void {
             }
             // Format 2: tool part with state containing input
             if (part?.type === "tool") {
-                const callId = part.callID
+                const callId = pairingIdOf(part)
                 if (!callId || !erroredCallIds.has(String(callId))) continue
                 const state = part.state
                 if (state?.input && typeof state.input === "object") {
@@ -1334,8 +1444,11 @@ export async function autoCompress(
         summaryTokens: outputTokens,
     })
 
-    // Record compression stats
-    const ratio = inputTokens > 0 ? 1 - outputTokens / inputTokens : 0
+    // Record compression stats.
+    // Clamped: a compression that does not shrink is 0% saved, not -330%. An
+    // unclamped ratio flows into the EMA in state.ts and the panel then prints
+    // a negative "Tokens saved" and a negative dollar "Saved".
+    const ratio = inputTokens > 0 && inputTokens > outputTokens ? 1 - outputTokens / inputTokens : 0
     addCompressionRecord(
         state,
         {

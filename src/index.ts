@@ -579,7 +579,14 @@ export default Plugin.define({
                             config.compress.protectUserMessages,
                         )
                         const outputTokens = await countTokens(summary)
-                        const ratio = inputTokens > 0 ? 1 - outputTokens / inputTokens : 0
+                        // Clamped: a compression that does not shrink is 0% saved,
+                        // not a negative saving. Same form as the other two
+                        // record sites (strategies.ts auto-compress, and the
+                        // compaction path below).
+                        const ratio =
+                            inputTokens > 0 && inputTokens > outputTokens
+                                ? 1 - outputTokens / inputTokens
+                                : 0
 
                         // DCP: register a compression block so future outgoing
                         // requests replace this range with the summary.
@@ -594,7 +601,16 @@ export default Plugin.define({
                                 outputTokens,
                             )
                             if (block) {
-                                blockNote = `\n\n_Block #${block.blockId}: ${block.coveredMessageIds.length} messages will collapse into this summary on future requests (${Math.round((1 - outputTokens / Math.max(1, inputTokens)) * 100)}% smaller)._\n_To restore them: ask to reset context._`
+                                // Clamped for the same reason as `ratio`: a
+                                // summary larger than its range must not be
+                                // announced as "-330% smaller".
+                                const smallerPct = Math.max(
+                                    0,
+                                    Math.round(
+                                        (1 - outputTokens / Math.max(1, inputTokens)) * 100,
+                                    ),
+                                )
+                                blockNote = `\n\n_Block #${block.blockId}: ${block.coveredMessageIds.length} messages will collapse into this summary on future requests (${smallerPct}% smaller)._\n_To restore them: ask to reset context._`
                             }
                         } catch {
                             // Best-effort: the summary is still returned to the model.
@@ -1179,7 +1195,14 @@ export default Plugin.define({
                         timestamp: Date.now(),
                         inputTokens,
                         outputTokens,
-                        ratio: inputTokens > outputTokens ? 1 - outputTokens / inputTokens : 0,
+                        // Clamped, and the same form as the other two record
+                        // sites (strategies.ts auto-compress, and the compress
+                        // tool above). A compression that does not shrink is 0%
+                        // saved, not a negative saving.
+                        ratio:
+                            inputTokens > 0 && inputTokens > outputTokens
+                                ? 1 - outputTokens / inputTokens
+                                : 0,
                         messageCount: messages.length,
                         success: true,
                     },
