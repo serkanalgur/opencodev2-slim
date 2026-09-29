@@ -6,12 +6,14 @@ import type { SessionState, SlimConfig } from "../src/lib/types"
 
 // ─── Does the width sweep actually reach the branches it claims? ───────────
 //
-// `ALLOWED_OVERFLOW` in tests/test.ts holds exactly three entries, one each for
-// `Cost Estimate`, `Top Topics` and `Recommendations` — the lines rendered from
+// `ALLOWED_OVERFLOW` in tests/test.ts is EMPTY: every line the panel can emit
+// now fits the 63-column frame. That is true of the three rendered from
 // unbounded server- or user-supplied strings (a model id, a topic name, free
-// text). Those three are NOT truncated, which is a deliberate design decision
-// deferred to a later change, recorded in the allowlist with that reason; every
-// NUMERIC magnitude the panel can render is inside the frame. That split is only
+// text) because each is now ELIDED through `fitValue` — a visible marker in
+// the middle for the model id, which a reader recognises by both the provider
+// and the model name, and at the end for topic names and recommendations — and
+// true of every NUMERIC magnitude, which was always inside the frame. An empty
+// allowlist is only
 // an honest claim if the sweep that produces it really renders every line the
 // panel can emit. A sweep that silently skips a branch proves nothing about that
 // branch: the guard would be green while the line it never rendered overflowed
@@ -273,9 +275,10 @@ describe("Panel width sweep: the fixture reaches every conditional line", () => 
 // ─── generateRecommendations: what the width test does and does not pin ─────
 //
 // The four recommendation strings were shortened this session so that the
-// `Recommendations` section would be one of the only three entries left in
-// `ALLOWED_OVERFLOW` — and it is still one of them, because the text itself is
-// unbounded free text and is deliberately not truncated. The ONLY assertions
+// `Recommendations` lines fit the frame WITHOUT relying on elision — the
+// wording production emits is expected to fit on its own, and elision is the
+// safety net for input that does not (an unbounded free-text value from
+// anywhere else). The ONLY assertions
 // on their length are
 // fragment regexes in the width test (`/Consider compressing/`,
 // `/truncation/`, `/Deduplication/`, `/No compressions yet/`). That is enough

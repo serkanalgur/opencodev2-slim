@@ -428,6 +428,33 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 3.1.0
+
+**FIXES**
+
+- Over-long panel values are now shortened instead of breaking the box. The
+  model id, topic name and recommendation lines are rendered from strings the
+  plugin does not control — a model id comes from the server, a topic name from
+  the model's own output — and a long enough value would run past the panel's
+  border. Each is now elided to fit, with a visible `…`.
+- A model id is shortened in the middle, keeping both ends. An id reads as
+  `provider/model`, and you recognise it by the provider at the front and the
+  model name at the end, so both are kept and the elision sits between them.
+  Topic names and recommendations are shortened at the end, where their meaning
+  is.
+- Values that already fit are never touched. No trimming, no normalisation, no
+  marker — a value that fits, or that fits exactly, is printed byte for byte as
+  received. The marker is the only thing that indicates shortening, and it is
+  placed so a reader can tell the value was cut from the middle or the end.
+
+**DOCS**
+
+- The panel's width guarantee is now complete. The three previously-documented
+  exceptions are gone, and the test suite's overflow allowlist is empty again:
+  the sweep drives all three lines past the raw boundary and confirms the
+  shortening is what makes them fit. The panel measures code points, so a status
+  icon occupies more cells than the count suggests.
+
 ### 3.0.4
 
 **FIXES**

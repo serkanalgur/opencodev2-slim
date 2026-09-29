@@ -440,6 +440,91 @@ function generateRecommendations(
 
 // ─── Panel Renderer ────────────────────────────────────────────────────────
 
+// The elision marker used by `fitValue` at all three unbounded-text sites.
+//
+// "…" (U+2026 HORIZONTAL ELLIPSIS) is the choice because it is ONE display
+// column — the whole point of the marker is to tell the reader the value was
+// shortened without itself costing width we do not have — and because it is
+// the conventional typographic signal for exactly that, so a reader parses
+// "…" as our annotation rather than as content.
+//
+// Confusion with a value that CONTAINS "…": not possible to construct a case
+// where the reader is misled. `fitValue` only ever emits the marker as the last
+// code point of a line's value (end-elision) or between two retained runs
+// (middle-elision), and a value that is not elided is returned byte-for-byte —
+// so a literal "…" inside an unelided value renders identically whether it came
+// from the model or from us. The worst outcome is that a genuinely
+// ellipsis-bearing value is read as an elided one, which costs the reader a
+// trailing character they can re-derive; a real provider id or a
+// `generateRecommendations` string does not contain one (both are pinned
+// verbatim in the test suite).
+export const ELISION_MARKER = "…"
+
+/** Columns of fixed text the frame spends on its own borders. */
+const FRAME_WIDTH = 63
+const FRAME_INNER = FRAME_WIDTH - 2
+
+/**
+ * Fit an unbounded string into `available` DISPLAY columns, eliding it with
+ * `ELISION_MARKER` if — and only if — it does not already fit.
+ *
+ * Width is measured in CODE POINTS (`[...s].length`), which is the same
+ * measure `renderPanel`'s frame and the width guard in tests/test.ts use: every
+ * glyph the panel emits is single-width, and `String.length` would be wrong for
+ * astral characters.
+ *
+ * Three properties this must hold, all of them load-bearing:
+ *   1. A value at or under `available` is returned BYTE-FOR-BYTE unchanged —
+ *      no marker, no trimming, no normalisation. Almost every real model id and
+ *      topic name is short, and a rule that reformats them would be a regression.
+ *   2. The result is never wider than `available`, so the fixed parts of the
+ *      line (prefix, `: N msgs (X)` suffix, the frame's own padding) are never
+ *      the thing that gives.
+ *   3. `available` is a budget for the VALUE only. Each caller computes it
+ *      from its own fixed text, because the three lines spend different
+ *      amounts: `│   Model: ` is 10 columns, `│   ` is 4, `│   • ` is 6, and a
+ *      topic line additionally carries a `: N msgs (X)` suffix of its own.
+ *
+ * `mode` follows what the reader uses to recognise the value:
+ *
+ *   - "middle" for a model id, which reads as `provider/model`. A reader
+ *     recognises it by BOTH ends — the head is the provider, the tail is the
+ *     model name (plus any `:tag` or version suffix). Cutting the tail loses
+ *     the model; cutting the head loses the provider. So both are kept and the
+ *     marker goes between them. The split is 2:1 head-to-tail (`HEAD_RATIO`):
+ *     the head carries the `provider/` half of the id and is the part that
+ *     scopes a collision between two ids, while the tail's version tag is
+ *     corroborating detail — and a tail of ~1/3 of a 51-column budget (17
+ *     columns) already holds "claude-sonnet-4-5" or "llama-3.3-70b-instruct".
+ *
+ *   - "end" for topic names and recommendations. Their meaningful content is
+ *     the opening phrase — the thing being discussed, the action being advised
+ *     — and there is no tail worth preserving, so the marker follows the
+ *     retained prefix.
+ */
+export function fitValue(value: string, available: number, mode: "middle" | "end"): string {
+    // Code points, not code units: slicing a surrogate pair in half emits a
+    // lone surrogate that is one display column but two `String.length` units,
+    // which is exactly the mismatch this guard exists to prevent.
+    const chars = [...value]
+    if (chars.length <= available) return value
+    const markerWidth = ELISION_MARKER.length
+    if (available <= 0) return ""
+    if (available <= markerWidth) return chars.slice(0, available).join("")
+    const budget = available - markerWidth
+    if (mode === "end") return chars.slice(0, budget).join("") + ELISION_MARKER
+    // 2:1 head-to-tail (see the docblock), with the remainder to the tail.
+    const head = Math.max(1, Math.ceil((budget * 2) / 3))
+    const tail = budget - head
+    if (tail === 0) return chars.slice(0, head).join("") + ELISION_MARKER
+    return chars.slice(0, head).join("") + ELISION_MARKER + chars.slice(chars.length - tail).join("")
+}
+
+/** Columns the value on a `│   Model: ` line may occupy. */
+function modelBudget(): number {
+    return FRAME_INNER - [...`   Model: `].length
+}
+
 export function renderPanel(data: PanelData): string {
     const lines: string[] = []
     
@@ -556,14 +641,26 @@ export function renderPanel(data: PanelData): string {
     lines.push("│ Cost Estimate:")
     lines.push(`│   Current: $${data.estimatedCost.toFixed(4)}`)
     lines.push(`│   Saved: $${data.costSaved.toFixed(4)}`)
-    lines.push(`│   Model: ${data.model}`)
+    // Unbounded server-supplied string. Middle-elided (see `fitValue`): both
+    // the provider and the model name are what make the id recognisable.
+    lines.push(`│   Model: ${fitValue(data.model, modelBudget(), "middle")}`)
     lines.push("")
     
     // Topics
     if (data.topics.length > 0) {
         lines.push("│ Top Topics:")
         for (const topic of data.topics.slice(0, 5)) {
-            lines.push(`│   ${topic.topic}: ${topic.count} msgs (${formatTokens(topic.tokens)})`)
+            // The topic NAME is the only unbounded part; the count and token
+            // figures are numbers and are never touched, so the suffix width is
+            // measured per topic and the name gets whatever is left of the
+            // inner width.
+            const suffix = `: ${topic.count} msgs (${formatTokens(topic.tokens)})`
+            const name = fitValue(
+                topic.topic,
+                FRAME_INNER - [...`   `].length - [...suffix].length,
+                "end",
+            )
+            lines.push(`│   ${name}${suffix}`)
         }
         lines.push("")
     }
@@ -571,7 +668,7 @@ export function renderPanel(data: PanelData): string {
     // Recommendations
     lines.push("│ Recommendations:")
     for (const rec of data.recommendations) {
-        lines.push(`│   • ${rec}`)
+        lines.push(`│   • ${fitValue(rec, FRAME_INNER - [...`   • `].length, "end")}`)
     }
     
     lines.push("└─────────────────────────────────────────────────────────────┘")

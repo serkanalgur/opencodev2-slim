@@ -19,7 +19,7 @@ import { resolveCompressLimits, resolveThreshold } from "../src/lib/config"
 // Namespace import so optional test hooks (resetThresholdWarnings) can be
 // probed at runtime without breaking the module graph when they are absent.
 import * as configModule from "../src/lib/config"
-import { buildPanelData, renderPanel, formatTokens } from "../src/lib/tui"
+import { buildPanelData, renderPanel, formatTokens, ELISION_MARKER } from "../src/lib/tui"
 import type { PanelData } from "../src/lib/tui"
 import { loadConfig } from "../src/lib/config"
 // `measureSession` is a test-only export (see its JSDoc): the rendered
@@ -3514,39 +3514,44 @@ describe("Panel box width", () => {
      * so a growing value cannot smuggle a second offender in under the same
      * entry (see `overflowingSections`).
      *
-     * Everything the panel renders from a NUMBER fits at worst-case
-     * magnitudes: the multi-fact lines that could not (Trigger, Prune) were
-     * split across two lines rather than truncated. What does NOT fit is
-     * everything rendered from an UNBOUNDED string, and that set is disclosed
-     * here rather than left to a reviewer's memory:
+     * EMPTY, and now that is a complete claim rather than a partial one. It
+     * used to hold three entries, one each for the three lines rendered from an
+     * UNBOUNDED server- or user-supplied string:
      *
-     *   - "Cost Estimate" — the `Model:` line. A model id is a server-supplied
-     *     string (a self-hosted gateway can name a model anything at all), and
-     *     it is emitted raw, so an id longer than ~40 columns overflows.
-     *   - "Top Topics" — a topic name. Topic names come from the model's own
-     *     output over the transcript, so nothing here bounds their length.
+     *   - "Cost Estimate" — the `Model:` line. A model id is server-supplied
+     *     (a self-hosted gateway can name a model anything at all).
+     *   - "Top Topics" — a topic name, derived from the model's own output over
+     *     the transcript, so nothing in this codebase bounds its length.
      *   - "Recommendations" — a recommendation string, free text by nature.
      *
-     * None of the three is truncated, and that is a DELIBERATE PRODUCTION
-     * DESIGN DECISION deferred to a later change, not an oversight: silently
-     * eliding a model id or a topic name is worse than a wide line, exactly as
-     * the Trigger/Prune splits reasoned. The value of recording them is that
-     * the claim is now in the code: a future change that truncates one of them
-     * will fail the exactness assertion below until its entry is removed on
-     * purpose, and a new over-wide line fails immediately.
+     * All three are now ELIDED rather than merely disclosed: each spends a
+     * per-line value budget on the fixed text of its own line (the prefix, the
+     * `: N msgs (X)` suffix, the frame's inner padding) and passes the
+     * remainder through `fitValue` (src/lib/tui.ts), which emits the value
+     * byte-for-byte when it fits and otherwise elides it with a visible marker
+     * — in the MIDDLE for the model id, which a reader recognises by both the
+     * provider and the model name, and at the END for topic names and
+     * recommendations, whose content is at the front. A marker is used rather
+     * than a silent cut precisely so a shortened value is never mistaken for a
+     * short one.
+     *
+     * The exactness assertion below is what makes the empty list meaningful: it
+     * compares the allowlist against the sections that ACTUALLY overflow, in
+     * both directions, so a stale entry (a line that no longer overflows) and a
+     * new offender are both failures. Re-adding an entry — or weakening the
+     * elision back into an overflow — therefore requires a conscious edit here
+     * rather than passing silently.
      */
-    const ALLOWED_OVERFLOW: string[] = ["Cost Estimate", "Top Topics", "Recommendations"]
+    const ALLOWED_OVERFLOW: string[] = []
 
     /**
-     * The `ALLOWED_OVERFLOW` entries that exist because of UNBOUNDED input
-     * rather than because of any swept magnitude.
+     * The three sections whose values are UNBOUNDED input, swept separately
+     * below with a 200-character value each.
      *
-     * A sweep that holds the model id, topic name and recommendation at their
-     * fixture values cannot reach these, so its exactness check is on the
-     * remainder — while a sweep that DOES drive those strings past the frame
-     * is the one that produces all three. Listing them separately is what lets
-     * both sweeps assert against the same single source of truth without either
-     * of them having to pretend it reached the others' cases.
+     * Retained as a named set (rather than deleted with the allowlist entries)
+     * because the fixture-magnitude sweep must still assert that it does NOT
+     * overflow in any of them: an over-wide line is then a defect, not a
+     * disclosure, so nothing may hide there.
      */
     const FREE_TEXT_SECTIONS: string[] = ["Cost Estimate", "Top Topics", "Recommendations"]
 
@@ -3664,18 +3669,19 @@ describe("Panel box width", () => {
         }
 
         // This sweep drives the free-text inputs (model id, topic name,
-        // recommendation) only at their fixture magnitudes, so it can never
-        // reach the three entries in ALLOWED_OVERFLOW that exist because those
-        // strings are UNBOUNDED — the worst-case sweep at the end of this
-        // describe is what reaches them, and it asserts the same list. So the
-        // exactness check here is on the REACHABLE remainder, plus a separate
-        // assertion that this sweep overflowed in none of the free-text
-        // sections: an entry must never be quietly absorbing an offender that
-        // is reachable without an extreme input.
-        const reachable = ALLOWED_OVERFLOW.filter((s) => !FREE_TEXT_SECTIONS.includes(s))
+        // recommendation) only at their fixture magnitudes, so it never reaches
+        // the regime the elision rule exists for — the worst-case sweep at the
+        // end of this describe drives those strings past the frame and asserts
+        // the same list. Both halves are checked against the single
+        // `ALLOWED_OVERFLOW` above, which is empty: the fixture sweep must
+        // overflow NOWHERE, and the worst-case sweep must overflow nowhere
+        // either. The two assertions below are no longer "the remainder" and
+        // "the disclosed free-text set" — they are the same empty claim from two
+        // different sweeps, and keeping them separate is what proves neither
+        // sweep quietly stopped reaching its lines.
         assert.deepStrictEqual(
             [...seenOverflow].filter((s) => !FREE_TEXT_SECTIONS.includes(s)),
-            reachable,
+            ALLOWED_OVERFLOW.filter((s) => !FREE_TEXT_SECTIONS.includes(s)),
             `the set of over-wide lines changed; update ALLOWED_OVERFLOW deliberately ` +
                 `(saw: ${JSON.stringify([...seenOverflow])})`,
         );
@@ -3683,7 +3689,7 @@ describe("Panel box width", () => {
             [...seenOverflow].filter((s) => FREE_TEXT_SECTIONS.includes(s)),
             [],
             `a line over-widened at FIXTURE magnitudes inside ${JSON.stringify(FREE_TEXT_SECTIONS)}; ` +
-                `those entries exist only for unbounded input, so they must not absorb this`,
+                `those values are elided, not disclosed, so nothing may overflow there at all`,
         )
     })
 
@@ -3954,8 +3960,9 @@ describe("Panel box width", () => {
         // figures, lifetime, threshold and prune all pushed to the widest value
         // `formatTokens` can return (and to MAX_SAFE_INTEGER itself). Nothing
         // swept here may overflow, and the exactness assertion at the end says
-        // so against the same `ALLOWED_OVERFLOW` the free-text cases below
-        // populate.
+        // so against the same `ALLOWED_OVERFLOW` the free-text cases below are
+        // checked against. With that list empty, both halves of the sweep must
+        // overflow nowhere.
         //
         // Message COUNTS stay at their fixture magnitudes: they are emitted raw
         // (not through `formatTokens`) and are the count of messages in one
@@ -4019,45 +4026,66 @@ describe("Panel box width", () => {
         // one request. The three lines below are rendered from UNBOUNDED
         // strings — a model id, a topic name, a recommendation — which have no
         // worst case short of "as long as the input is". Holding the sweep at
-        // fixture magnitudes therefore proved nothing about them, and
-        // `ALLOWED_OVERFLOW: []` was an incomplete claim rather than a clean
-        // one.
+        // fixture magnitudes therefore proves nothing about them, and while
+        // they were merely DISCLOSED in `ALLOWED_OVERFLOW` the allowlist was
+        // never an empty claim.
         //
-        // They are driven past the frame here, the overflows are attributed to
-        // their section, and each one is asserted to be the ONLY section that
-        // overflows in its own panel — so an entry cannot quietly absorb a
-        // second offender. The lines are not truncated; see `ALLOWED_OVERFLOW`.
-        const freeText: { section: string; overrides: Partial<PanelData> }[] = [
+        // They are driven 200 columns past the frame here. Each case now
+        // asserts the opposite of what it used to: the panel must NOT overflow,
+        // in this section or any other, because `fitValue` elides the value
+        // rather than letting the line burst. To keep the sweep honest — so it
+        // cannot quietly stop reaching the regime it exists to test — each case
+        // also asserts that its RAW value is longer than the value budget of
+        // that line, so a sweep that regressed to a shorter input would fail
+        // here rather than pass by never eliding anything. The marker is
+        // required to be present for the same reason.
+        const freeText: { section: string; raw: string; overrides: Partial<PanelData> }[] = [
             {
                 section: "Cost Estimate",
                 // A 200-character model id. A real provider id is ~20 columns;
-                // a self-hosted gateway can name a model anything at all, and
-                // the id is emitted raw.
+                // a self-hosted gateway can name a model anything at all.
+                raw: "m".repeat(200),
                 overrides: { model: "m".repeat(200) },
             },
             {
                 section: "Top Topics",
                 // A topic name is derived from the model's own output over the
                 // transcript, so nothing in this codebase bounds its length.
+                raw: "t".repeat(200),
                 overrides: { topics: [{ topic: "t".repeat(200), count: 1, tokens: 10 }] },
             },
             {
                 section: "Recommendations",
                 // Free text by nature.
+                raw: "r".repeat(200),
                 overrides: { recommendations: ["r".repeat(200)] },
             },
         ]
-        for (const { section, overrides } of freeText) {
+        for (const { section, raw, overrides } of freeText) {
             const text = renderPanel(panelDataWith(overrides))
-            const sections = overflowingSections(text);
+            // The raw value is 200 columns, past every budget on these lines
+            // (51 for the model id, 45 for a topic name at the fixture's
+            // `: 1 msgs (10)` suffix, 56 for a recommendation — the `│   • `
+            // prefix is 5 columns, not 6), so elision — not a shorter input —
+            // is what makes the line fit. tests/elision.test.ts pins each of
+            // those three budgets at its boundary.
+            assert.ok(
+                [...raw].length > 55,
+                `the ${section} case must drive its value past the frame; ` +
+                    `otherwise this sweep no longer tests elision: ${[...raw].length} columns`,
+            )
             assert.deepStrictEqual(
-                sections,
-                [section],
-                `the ${section} case must overflow the frame in that section and nowhere else ` +
-                    `(so the ALLOWED_OVERFLOW entry for it is not absorbing an unrelated line), ` +
-                    `or its entry is stale because the line now fits:\n${text}`,
+                overflowingSections(text),
+                [],
+                `the ${section} case must fit the frame in EVERY section now that the value ` +
+                    `is elided rather than disclosed:\n${text}`,
             );
-            for (const found of sections) seenOverflow.add(found)
+            assert.ok(
+                text.includes(ELISION_MARKER),
+                `the ${section} case must render the elision marker, so a value that fit ` +
+                    `unelided cannot be mistaken for a shortened one:\n${text}`,
+            );
+            for (const found of overflowingSections(text)) seenOverflow.add(found)
         }
 
         assert.deepStrictEqual(

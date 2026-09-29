@@ -8,7 +8,7 @@ import { findLastCompactionIndex, readMeasuredUsage } from "./lib/usage"
 // Shared formatter, not a mirrored copy: src/lib/tui.ts owns the `panel` tool
 // renderer and is already on this module's dependency graph's leaf side (it
 // imports nothing from src/tui.tsx), so importing it here adds no cycle.
-import { formatTokens } from "./lib/tui"
+import { fitValue, formatTokens } from "./lib/tui"
 import type { SessionState } from "./lib/types"
 import { PLUGIN_VERSION } from "./lib/version"
 
@@ -266,7 +266,13 @@ function renderPanelText(
         }
         if (trigger) lines.push(...trigger)
         if (real.cost > 0) lines.push(`│ Cost: $${real.cost.toFixed(6)}`)
-        lines.push(`│ Model: ${real.model}`)
+        // Same elision rule as the `Model:` line in `renderPanel` (src/lib/tui.ts)
+        // — same helper, same "middle" mode, same budget arithmetic off the
+        // shared 63-column frame. Its prefix is `│ Model: ` (9 columns, not
+        // 10: this renderer uses one space of indent, not three), so its value
+        // budget is 2 wider. A model id is unbounded and server-supplied, and
+        // this line is the one place the TUI surface prints it.
+        lines.push(`│ Model: ${fitValue(real.model, 61 - [...` Model: `].length, "middle")}`)
     }
     lines.push("└─────────────────────────────────────────────────────────────┘")
     return lines.join("\n")
