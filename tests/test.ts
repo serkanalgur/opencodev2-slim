@@ -20,7 +20,10 @@ import { resolveCompressLimits, resolveThreshold } from "../src/lib/config"
 // probed at runtime without breaking the module graph when they are absent.
 import * as configModule from "../src/lib/config"
 import { buildPanelData, renderPanel } from "../src/lib/tui"
-import tuiPlugin, { deriveStats } from "../src/tui"
+// `measureSession` is a test-only export (see its JSDoc): the rendered
+// surfaces gate occupancy on `hasPrompt`, so the fallback it guards is
+// unreachable from /panel, /status or /compress.
+import tuiPlugin, { deriveStats, measureSession } from "../src/tui"
 import type { MessageWithParts, SessionState, SlimConfig } from "../src/lib/types"
 
 // ─── Token Counting ─────────────────────────────────────────────────────────
@@ -325,7 +328,12 @@ describe("TUI Panel", () => {
             config,
             "real-model",
             {
+                // `tokens` is the session's LIFETIME CUMULATIVE spend counter and
+                // must NOT stand in for context occupancy (issue #11). Only
+                // `promptTokens` — the last request's input + cache.read +
+                // cache.write — describes how full the window is.
                 tokens: 220326,
+                promptTokens: 220326,
                 cost: 0.25,
                 contextLimit: 1000000,
                 model: "real-model",
@@ -865,34 +873,49 @@ describe("Multi-Format Message Handling", () => {
         assert.ok(!filtered.some((m: any) => m.id === "1" || m.id === "2"))
     })
 
-    it("resolveModelContextLimit falls back to model.list()", async () => {
+    it("resolveModelContextLimit never borrows another model's window", async () => {
+        // The active model is NOT in the list, and default() gives no window.
+        // There is no honest answer, so we must warn and take the 200k safety
+        // net — NOT the 175k belonging to an unrelated Anthropic model. That
+        // borrowing is exactly issue #11 (a 128k model measured against another
+        // provider's 1M window).
+        resetContextLimitFallbackWarning()
         const mockCtx = {
             model: {
                 default: () => Promise.resolve(undefined),
                 list: () => [
-                    // Deliberately NOT 200000: that is DEFAULT_MODEL_LIMIT, so a
-                    // 200000 result would also be produced by the safety net and
-                    // the assertion could not tell a real list() fallback apart.
                     { providerID: "anthropic", modelID: "claude-sonnet-4-20250514", limit: { context: 175000 } },
                     { providerID: "openai", modelID: "gpt-4o", limit: { context: 128000 } },
                 ],
             },
         }
-        // Since no default is set, it should try list() and find the first model with a limit
-        const limit = await (resolveModelContextLimit as any)(mockCtx)
+        const warnings: string[] = []
+        const originalWarn = console.warn
+        console.warn = (...args: unknown[]) => {
+            warnings.push(args.map(String).join(" "))
+        }
+        let limit: number
+        try {
+            limit = await (resolveModelContextLimit as any)(mockCtx)
+        } finally {
+            console.warn = originalWarn
+        }
         assert.strictEqual(
             limit,
-            175000,
-            "the first listed model's window wins — not the 200k safety net",
+            200000,
+            "an unrelated model's window must never be borrowed — 200k + warning instead",
         )
-        assert.ok(limit > 0)
+        assert.ok(
+            warnings.some((w) => w.includes("[slim] could not read the model context window")),
+            `the safety net must announce itself, got: ${JSON.stringify(warnings)}`,
+        )
     })
 })
 
 // ─── Import for new tests ──────────────────────────────────────────────────
 
 import { messageHasCompress, purgeStaleToolErrors, applyCompressedRanges, syncCompressionBlocks } from "../src/lib/strategies"
-import { resolveModelContextLimit } from "../src/index"
+import { resolveModelContextLimit, resetContextLimitFallbackWarning } from "../src/index"
 
 // ─── resolveThreshold ──────────────────────────────────────────────────────
 
@@ -1280,6 +1303,8 @@ function makePanelHarness(
         transcript?: unknown[]
         sessionInfo?: unknown
         contextError?: string
+        /** Entries returned by `client.model.list()`; defaults to an empty list. */
+        models?: unknown[]
     } = {},
 ): PanelHarness {
     const commands: any[] = []
@@ -1339,7 +1364,7 @@ function makePanelHarness(
                 get: async (_args: any) => options.sessionInfo ?? null,
                 synthetic: async (args: any) => void syntheticWrites.push(args),
             },
-            model: { list: async () => ({ data: [] }) },
+            model: { list: async () => ({ data: options.models ?? [] }) },
         },
     }
 
@@ -1401,7 +1426,14 @@ describe("/panel Command", () => {
         const text = harness.dialogs[0].message
         assert.ok(text.includes("SLIM CONTEXT PANEL"), text)
         assert.ok(text.includes("│ Messages: 2"), "transcript read via the v2 API")
-        assert.ok(text.includes("Measured tokens: 1500"), "session.get usage shown")
+        // The session.get total is lifetime spend, not occupancy: with no
+        // per-turn usage in the transcript it is reported as a labelled Lifetime
+        // line with no percent and no health status (issue #11). The old label
+        // was "Measured tokens: 1500" on its own line.
+        assert.ok(
+            text.includes("│ Lifetime: 1.5K tokens (cumulative spend, fill unknown)"),
+            `lifetime spend shown as spend, not occupancy:\n${text}`,
+        )
         assert.ok(text.includes("Model: test-model"), text)
 
         assert.deepStrictEqual(
@@ -1853,6 +1885,7 @@ describe("resolveModelContextLimit (v2 model shapes)", () => {
     })
 
     it("falls back to the built-in 200k window with a warning when both reads fail", async () => {
+        resetContextLimitFallbackWarning()
         const ctx = {
             model: {
                 default: async () => ({ data: null }),
@@ -2848,5 +2881,688 @@ describe("prune frontier stability", () => {
             [...second.outputs.values()].sort(),
         )
         assert.deepStrictEqual(first.stats, second.stats)
+    })
+})
+
+// ─── Panel occupancy is never the lifetime counter (issue #11) ─────────────
+//
+// Regression lock for GitHub issue #11. `buildPanelData` used to derive its
+// headline occupancy from `measured.tokens` — the session's LIFETIME
+// CUMULATIVE counter — whenever the transcript carried no per-call prompt
+// measurement. That counter (input+output+reasoning+cache.read+cache.write
+// summed over the whole session) exceeds the window by orders of magnitude, so
+// the panel reported a bogus "100% critical" on a nearly empty session.
+//
+// `measured.tokens` is still reported — on its own `cumulativeTokens` field,
+// rendered as a separately-labelled Lifetime line. It must never be the
+// headline.
+
+describe("Panel occupancy never falls back to the lifetime counter", () => {
+    const LIFETIME = 56_100_000
+    const smallTranscript: MessageWithParts[] = [
+        {
+            info: { id: "1", role: "user", sessionID: "s1", time: { created: 0 } } as any,
+            parts: [{ type: "text", text: "Hello" }] as any,
+        },
+    ]
+
+    it("uses the transcript estimate for the headline, not measured.tokens, when no promptTokens exist", async () => {
+        // A small transcript, a 1M window, and a lifetime counter of 56.1M with
+        // NO promptTokens — the exact shape of issue #11.
+        const panel = await buildPanelData(
+            "s1",
+            smallTranscript,
+            makeState(),
+            makeConfig({ maxContextLimit: "80%" }),
+            "test-model",
+            {
+                tokens: LIFETIME,
+                // promptTokens deliberately absent: the transcript has no usage.
+                cost: 1.5,
+                contextLimit: 1_000_000,
+                model: "test-model",
+            },
+        )
+
+        assert.notStrictEqual(
+            panel.currentTokens,
+            LIFETIME,
+            "the headline must not be the lifetime counter (this is issue #11)",
+        )
+        assert.ok(
+            panel.currentTokens < 10_000,
+            `headline must be the small transcript estimate, got ${panel.currentTokens}`,
+        )
+        assert.ok(
+            panel.usagePercent < 1,
+            `56.1M against a 1M window would read ${panel.usagePercent}%; the headline must stay small`,
+        )
+        assert.notStrictEqual(
+            panel.status,
+            "critical",
+            "a small transcript is not a critical window",
+        )
+    })
+
+    it("keeps the lifetime total on cumulativeTokens and labels the source estimated", async () => {
+        const panel = await buildPanelData(
+            "s1",
+            smallTranscript,
+            makeState(),
+            makeConfig({ maxContextLimit: "80%" }),
+            "test-model",
+            { tokens: LIFETIME, cost: 1.5, contextLimit: 1_000_000, model: "test-model" },
+        )
+
+        assert.strictEqual(
+            panel.cumulativeTokens,
+            LIFETIME,
+            "the lifetime spend is still reported, just never as occupancy",
+        )
+        assert.strictEqual(
+            panel.tokenSource,
+            "estimated",
+            "with no per-call prompt size the headline is our estimate, not a measurement",
+        )
+
+        // The lifetime figure must appear on a Lifetime line only — never on
+        // the Context line, which is the occupancy read.
+        const lines = renderPanel(panel).split("\n")
+        const lifetime = lines.find((line) => line.includes("Lifetime:"))
+        assert.ok(lifetime, `a Lifetime line expected:\n${lines.join("\n")}`)
+        assert.ok(lifetime.includes("56.1M"), lifetime)
+        const contextLine = lines.find((line) => line.includes("Context: ["))
+        assert.ok(contextLine, "context bar rendered")
+        assert.ok(
+            !contextLine.includes("56.1M"),
+            `the Context figure must never be the lifetime counter: ${contextLine}`,
+        )
+    })
+})
+
+// ─── Panel box width guard ────────────────────────────────────────────────
+//
+// Regression class: a long line punches through the fixed 63-column box frame
+// and corrupts the panel's border. The instance this replaces was the pre-fix
+// `│ Measured tokens: 56100000  (100% of 200000)  [critical]`, which is why
+// the lifetime figure is now rendered through `formatTokens`.
+//
+// Width is measured in DISPLAY columns, not UTF-16 `String.length`: the two
+// disagree for every astral glyph (an emoji counts 2 in `String.length` but
+// occupies 1-2 terminal cells), and a check built on `String.length` silently
+// measures the wrong thing for exactly the characters most likely to appear
+// in a status line.
+//
+// KNOWN PRE-EXISTING OVERFLOW, deliberately excluded: the `Trigger:` line is
+// 67-72 columns wide on the current tree AND at HEAD (v3.0.1), independent of
+// issue #11. It is a real cosmetic defect but a different one; asserting on it
+// here would mean failing on code that is correct for #11, or editing `src/`
+// outside this task's remit. The allowlist below is checked for exactness, so
+// a FIXED Trigger line fails until its entry is removed, and any NEW overflow
+// fails immediately.
+
+describe("Panel box width", () => {
+    /**
+     * Display width in terminal cells for the text the panel emits (ASCII,
+     * box-drawing, and the occasional emoji). Code points is the right measure
+     * here: every glyph the panel uses is single-width, and the alternative —
+     * `String.length` — is provably wrong for astral characters, which is the
+     * mistake this guard exists to prevent.
+     */
+    function displayWidth(line: string): number {
+        return [...line].length
+    }
+
+    /**
+     * The one line permitted to exceed the frame, and why. Matched on the text
+     * before the first ":" so a growing value cannot smuggle a second offender
+     * in under the same prefix. Asserted to be exactly the set of overflowing
+     * lines, so this stays honest in both directions: a new offender fails, and
+     * a repaired one fails until its entry is deleted.
+     */
+    const ALLOWED_OVERFLOW = ["│ Trigger"]
+
+    /** Drive the real /panel command (which calls renderPanelText) and return the box. */
+    async function panelTextFor(options: {
+        promptTokens?: number
+        contextLimit: number
+        lifetime: number
+        model?: string
+    }): Promise<string> {
+        const promptTokens = options.promptTokens
+        const harness = makePanelHarness({
+            transcript: promptTokens === undefined
+                ? [{ type: "user", text: "hello" }]
+                : [
+                      {
+                          type: "assistant",
+                          tokens: {
+                              input: promptTokens,
+                              output: 500,
+                              cache: { read: 0, write: 0 },
+                          },
+                      },
+                  ],
+            sessionInfo: {
+                tokens: { input: options.lifetime, output: 100_000 },
+                cost: 1,
+                model: {
+                    id: options.model ?? "test-model",
+                    providerID: "acme",
+                    limit: { context: options.contextLimit },
+                },
+            },
+        })
+        const run = await startSlash(harness, "panel")
+        await run()
+        assert.strictEqual(harness.dialogs.length, 1, "panel output goes to a dialog")
+        return harness.dialogs[0].message
+    }
+
+    it("keeps every renderPanelText line except the known Trigger overflow inside the 63-column frame", async () => {
+        // Sweep the whole occupancy range (including absent and over-window)
+        // across several window sizes, always with an enormous lifetime
+        // counter attached. Any line that grows past the frame fails with the
+        // offending text, so the guard catches the class, not one instance.
+        const windows = [32_768, 128_000, 200_000, 1_000_000]
+        const occupancies: (number | undefined)[] = [
+            undefined, // no per-turn usage: the "fill unknown" branch
+            0, 1, 10, 50, 70, 75, 90, 95, 100, 150, 5_610,
+        ]
+        const seenOverflow = new Set<string>()
+
+        for (const contextLimit of windows) {
+            for (const percent of occupancies) {
+                const promptTokens =
+                    percent === undefined ? undefined : Math.round((contextLimit * percent) / 100)
+                const rendered = await panelTextFor({
+                    promptTokens,
+                    contextLimit,
+                    lifetime: 56_000_000,
+                })
+                for (const line of rendered.split("\n")) {
+                    if (displayWidth(line) > 63) {
+                        seenOverflow.add(line.split(":")[0])
+                        continue
+                    }
+                    assert.ok(
+                        displayWidth(line) <= 63,
+                        `line is ${displayWidth(line)} columns, over the 63-column frame ` +
+                            `(window=${contextLimit}, occupancy=${String(percent)}%): ` +
+                            `${JSON.stringify(line)}`,
+                    )
+                }
+            }
+        }
+
+        // The allowlist must be exactly what actually overflows: a new offender
+        // shows up here, and a repaired one means the entry must be deleted.
+        assert.deepStrictEqual(
+            [...seenOverflow],
+            ALLOWED_OVERFLOW,
+            `the set of over-wide lines changed; update ALLOWED_OVERFLOW deliberately ` +
+                `(saw: ${JSON.stringify([...seenOverflow])})`,
+        )
+    })
+
+    it("keeps the Lifetime line inside the frame at every magnitude, not just at 56.1M", async () => {
+        // The specific instance that was fixed: an unformatted lifetime total
+        // ("56100000") is 8 characters where "56.1M" is 4, so a regression that
+        // drops `formatTokens` from this line overflows here even though the
+        // 56.1M rendering still fits comfortably.
+        //
+        // Swept up to 1e9, which `formatTokens` renders as "1000.0M" (6 chars).
+        // NOT swept to 1e12: `formatTokens` scales in a single step
+        // (`>= 1e6 → /1e6`), so 999_999_999_999 renders as the 10-character
+        // "1000000.0M" and overflows the frame. That is a separate pre-existing
+        // defect in the formatter (present at HEAD, unrelated to #11) and is
+        // reported rather than pinned here, since fixing it means editing
+        // `src/` outside this task's remit.
+        for (const lifetime of [1, 999, 1_000, 999_999, 1_000_000, 56_100_000, 999_999_999]) {
+            const text = await panelTextFor({
+                promptTokens: 1_000,
+                contextLimit: 200_000,
+                lifetime,
+            })
+            const line = text
+                .split("\n")
+                .find((l) => l.includes("Lifetime:"))
+            assert.ok(line, `a Lifetime line expected for lifetime=${lifetime}:\n${text}`)
+            assert.ok(
+                displayWidth(line) <= 63,
+                `Lifetime line is ${displayWidth(line)} columns at lifetime=${lifetime}: ` +
+                    `${JSON.stringify(line)}`,
+            )
+        }
+    })
+})
+
+// ─── /panel no-per-turn-usage branch ──────────────────────────────────────
+//
+// With no per-message usage in the transcript, the only server figure is the
+// lifetime cumulative counter. It is spend, not occupancy, so the panel must
+// print exactly one line saying so — with no window percentage and no health
+// status beside it. The pre-fix line was
+// `│ Measured tokens: 56100000  (100% of 200000)  [critical]`.
+
+describe("/panel without per-turn usage", () => {
+    async function panelTextFor(
+        tokens: Record<string, number>,
+        models?: unknown[],
+    ): Promise<string> {
+        const harness = makePanelHarness({
+            transcript: [{ type: "user", text: "hello" }],
+            sessionInfo: {
+                tokens,
+                cost: 0.5,
+                model: { id: "test-model", providerID: "acme", limit: { context: 200000 } },
+            },
+            models,
+        })
+        const run = await startSlash(harness, "panel")
+        await run()
+        assert.strictEqual(harness.dialogs.length, 1, "panel output goes to a dialog")
+        return harness.dialogs[0].message
+    }
+
+    it("prints exactly one Lifetime line with the formatted total and no percent or status", async () => {
+        // 56.1M tokens of lifetime spend on a 200k window: 28050%, which the
+        // old code clamped to a confident "100% ... [critical]".
+        const text = await panelTextFor({
+            input: 56_000_000,
+            output: 100_000,
+            cache: { read: 0, write: 0 },
+        })
+        const lines = text.split("\n")
+
+        const lifetimeLines = lines.filter((line) => line.includes("Lifetime:"))
+        assert.strictEqual(
+            lifetimeLines.length,
+            1,
+            `exactly one Lifetime line expected:\n${text}`,
+        )
+
+        const line = lifetimeLines[0]
+        assert.ok(line.includes("56.1M"), `the formatted lifetime total must be shown: ${line}`)
+        assert.ok(
+            line.includes("fill unknown"),
+            `the line must say the window fill cannot be derived from it: ${line}`,
+        )
+
+        // What the line must NOT contain: the pre-fix conflation.
+        assert.ok(
+            !line.includes("Measured tokens:"),
+            `the lifetime counter must not be labelled a measurement: ${line}`,
+        )
+        assert.ok(
+            !line.includes("%"),
+            `no window percentage may sit beside a lifetime figure: ${line}`,
+        )
+        for (const status of ["healthy", "warning", "critical", "unknown", "n/a"]) {
+            assert.ok(
+                !line.includes(`[${status}]`),
+                `no health status may sit beside a lifetime figure: ${line}`,
+            )
+        }
+        assert.ok(
+            !/of\s+[\d.]+[KM]?\b/.test(line),
+            `the lifetime figure must not be presented against a window: ${line}`,
+        )
+    })
+
+    it("never renders a 100% occupancy from a lifetime counter on any surface", async () => {
+        const harness = makePanelHarness({
+            transcript: [{ type: "user", text: "hello" }],
+            sessionInfo: {
+                tokens: { input: 56_000_000, output: 100_000, cache: { read: 0, write: 0 } },
+                cost: 0.5,
+                model: { id: "test-model", providerID: "acme", limit: { context: 200000 } },
+            },
+        })
+        for (const command of ["panel", "status", "compress"]) {
+            const run = await startSlash(harness, command)
+            await run()
+        }
+        const output = [
+            ...harness.dialogs.map((d) => d.message),
+            ...harness.syntheticWrites.map((w) => String(w.text ?? "")),
+        ].join("\n")
+
+        // The Trigger line legitimately carries percentages of the WINDOW
+        // (e.g. "80.0% of 200.0K window") — that is a threshold, not occupancy.
+        // What must never appear is an occupancy percentage: a `%` sitting
+        // directly beside the 56.1M lifetime figure.
+        assert.ok(
+            !/56\.1M[^│\n]*%/.test(output) && !/%[^│\n]*56\.1M/.test(output),
+            `no percentage may be derived from the lifetime counter:\n${output}`,
+        )
+        for (const line of output.split("\n")) {
+            if (line.includes("Lifetime") || line.includes("lifetime")) {
+                assert.ok(
+                    !/56,100,000[^\n]*%/.test(line) && !/%[^\n]*56,100,000/.test(line),
+                    `lifetime spend must not carry a window percentage: ${line}`,
+                )
+            }
+        }
+    })
+})
+
+// ─── /status health is UNKNOWN when occupancy cannot be measured ─────────
+//
+// Regression: `/status` derived its health from `real.usagePercent` with no
+// measurement in sight. With no per-message usage in the transcript that
+// percent is 0 — "unknown", not "empty" — so the old code printed a confident
+// "🟢 HEALTHY" for a session whose real occupancy it could not know. A false
+// all-clear is as wrong as the false "🔴 CRITICAL" the lifetime fallback
+// caused, and harder to notice.
+
+describe("/status health reporting", () => {
+    /** Drive the real /status command and return the dialog body. */
+    async function statusText(options: {
+        promptInput?: number
+        limit?: number
+        lifetime?: number
+    }): Promise<string> {
+        const limit = options.limit ?? 100_000
+        const harness = makePanelHarness({
+            // A transcript with NO per-message usage: occupancy is unmeasurable.
+            transcript: [{ type: "user", text: "hello" }],
+            sessionInfo: {
+                tokens: { input: options.lifetime ?? 56_000_000, output: 100_000 },
+                cost: 1,
+                model: { id: "test-model", providerID: "acme", limit: { context: limit } },
+            },
+        })
+        const run = await startSlash(harness, "status")
+        await run()
+        assert.strictEqual(harness.dialogs.length, 1, "/status reports through a dialog")
+        return harness.dialogs[0].message
+    }
+
+    it("reports ⚪ UNKNOWN, never a confident health, when the transcript has no per-message usage", async () => {
+        const text = await statusText({})
+        assert.ok(
+            text.includes("⚪ UNKNOWN"),
+            `an unmeasurable occupancy must read UNKNOWN, not a health:\n${text}`,
+        )
+        for (const status of ["🟢 HEALTHY", "🟡 WARNING", "🔴 CRITICAL"]) {
+            assert.ok(
+                !text.includes(status),
+                `no confident health may be claimed without a measurement (${status}):\n${text}`,
+            )
+        }
+    })
+
+    it("still reports HEALTHY / WARNING / CRITICAL for a real measurement", async () => {
+        // The three measured states must keep working — the UNKNOWN branch is
+        // only for "cannot measure", never a replacement for the thresholds.
+        const cases: { input: number; expected: string; label: string }[] = [
+            { input: 10_000, expected: "🟢 HEALTHY", label: "~10% of the window" },
+            { input: 75_000, expected: "🟡 WARNING", label: "~75% of the window" },
+            { input: 95_000, expected: "🔴 CRITICAL", label: "~95% of the window" },
+        ]
+        for (const { input, expected, label } of cases) {
+            const harness = makePanelHarness({
+                transcript: [
+                    {
+                        type: "assistant",
+                        tokens: { input, output: 500, cache: { read: 0, write: 0 } },
+                    },
+                ],
+                sessionInfo: {
+                    tokens: { input: 56_000_000, output: 100_000 },
+                    cost: 1,
+                    model: { id: "test-model", providerID: "acme", limit: { context: 100_000 } },
+                },
+            })
+            const run = await startSlash(harness, "status")
+            await run()
+            const text = harness.dialogs[0].message
+            assert.ok(
+                text.includes(expected),
+                `a measured ${label} must still report ${expected}:\n${text}`,
+            )
+        }
+    })
+
+    it("clamps an over-window measurement to CRITICAL without throwing or rendering nonsense", async () => {
+        const harness = makePanelHarness({
+            transcript: [
+                {
+                    type: "assistant",
+                    tokens: { input: 150_000, output: 500, cache: { read: 0, write: 0 } },
+                },
+            ],
+            sessionInfo: {
+                tokens: { input: 56_000_000, output: 100_000 },
+                cost: 1,
+                model: { id: "test-model", providerID: "acme", limit: { context: 100_000 } },
+            },
+        })
+        const run = await startSlash(harness, "status")
+        await run() // must not throw
+        const text = harness.dialogs[0].message
+        assert.ok(
+            text.includes("🔴 CRITICAL"),
+            `a prompt larger than the window is critical:\n${text}`,
+        )
+        assert.ok(
+            !/NaN|Infinity|undefined/.test(text),
+            `an over-window figure must not render nonsense:\n${text}`,
+        )
+        assert.ok(
+            text.includes("(100%)"),
+            `the displayed percent is clamped, not 150%:\n${text}`,
+        )
+    })
+})
+
+// ─── TUI context-window resolver never borrows another model's window ─────
+//
+// The other half of issue #11. `measureSession` used to fall back to matching
+// on `modelID` alone, so when two providers expose the same `modelID` — or
+// when the active model is simply absent from the list — the panel measured a
+// 128k session against an unrelated provider's 1M window and reported every
+// occupancy as a fraction of a window we are not running.
+
+describe("TUI context-window resolver", () => {
+    /** Drive the real /panel command and return the rendered box. */
+    async function panelFor(
+        sessionInfo: unknown,
+        models: unknown[],
+    ): Promise<string> {
+        const harness = makePanelHarness({ transcript: [], sessionInfo, models })
+        const run = await startSlash(harness, "panel")
+        await run()
+        assert.strictEqual(harness.dialogs.length, 1, "panel output goes to a dialog")
+        return harness.dialogs[0].message
+    }
+
+    it("does not borrow another provider's 1M window when the active model is absent from the list", async () => {
+        // The exact shape of issue #11: the active model is a 128k model, and
+        // the registry holds an unrelated provider's 1M model.
+        const text = await panelFor(
+            {
+                tokens: { input: 10_000, output: 500 },
+                cost: 0.1,
+                model: { id: "active-model", providerID: "acme", limit: { context: 128_000 } },
+            },
+            [
+                { providerID: "othercorp", modelID: "gigantic", limit: { context: 1_000_000 } },
+            ],
+        )
+        assert.ok(
+            !/1\.0M window/.test(text),
+            `an unrelated provider's 1M window must never become ours:\n${text}`,
+        )
+        assert.ok(
+            text.includes("128.0K window"),
+            `the active model's own 128k window is the honest answer:\n${text}`,
+        )
+    })
+
+    it("does not borrow a same-modelID entry from a different provider", async () => {
+        // The specific case the exact-match tightening defends against: two
+        // providers expose the SAME modelID, and only one of them is active.
+        const text = await panelFor(
+            {
+                tokens: { input: 10_000, output: 500 },
+                cost: 0.1,
+                // Active model is "shared-model" on provider "acme" at 128k.
+                model: { id: "shared-model", providerID: "acme", limit: { context: 128_000 } },
+            },
+            [
+                // Same modelID, different provider, huge window. A modelID-only
+                // match latches onto this one.
+                {
+                    providerID: "othercorp",
+                    modelID: "shared-model",
+                    limit: { context: 1_000_000 },
+                },
+            ],
+        )
+        assert.ok(
+            !/1\.0M window/.test(text),
+            `a modelID collision across providers must not hand back the wrong window:\n${text}`,
+        )
+        assert.ok(
+            text.includes("128.0K window"),
+            `the active model's own window must be used:\n${text}`,
+        )
+    })
+
+    it("uses the exact providerID+modelID match when the active model IS in the list", async () => {
+        // The tightening must not have broken the normal path: an exact match
+        // on both fields still resolves, and prefers the right entry even when
+        // a same-modelID impostor comes first in the list.
+        const text = await panelFor(
+            {
+                tokens: { input: 10_000, output: 500 },
+                cost: 0.1,
+                model: { id: "shared-model", providerID: "acme", limit: { context: 128_000 } },
+            },
+            [
+                { providerID: "othercorp", modelID: "shared-model", limit: { context: 1_000_000 } },
+                { providerID: "acme", modelID: "shared-model", limit: { context: 256_000 } },
+            ],
+        )
+        assert.ok(
+            text.includes("256.0K window"),
+            `the exact acme/shared-model entry must win over the impostor:\n${text}`,
+        )
+        assert.ok(
+            !/1\.0M window/.test(text),
+            `the impostor's window must not appear:\n${text}`,
+        )
+    })
+})
+
+// ─── measureSession occupancy source (issue #11, direct) ──────────────────
+//
+// Mutation note: the `contextTokens` fallback in `measureSession` is NOT
+// observable through /panel, /status or /compress. All three render the
+// occupancy only when `promptTokens` exists, so `promptTokens ?? 0` and
+// `promptTokens ?? lifetimeTokens` produce identical output on every surface —
+// verified by mutation testing, where reintroducing the lifetime fallback
+// breaks no rendered-surface test. These tests therefore call the exported
+// `measureSession` directly, which is why the test-only export exists.
+
+describe("measureSession occupancy source", () => {
+    /** A PluginContext shaped like the harness, but minimal and purpose-built. */
+    function measuringContext(sessionInfo: unknown, messages: unknown[]) {
+        return {
+            client: {
+                session: {
+                    get: async () => sessionInfo,
+                    context: async () => messages,
+                },
+                model: { list: async () => ({ data: [] }) },
+            },
+            ui: { toast: { show: () => {} } },
+        } as any
+    }
+
+    it("returns 0% occupancy when no per-turn usage exists, even with a huge lifetime total", async () => {
+        const real = await measureSession(
+            measuringContext(
+                {
+                    tokens: { input: 56_000_000, output: 1_000_000 },
+                    cost: 1,
+                    model: { id: "test-model", providerID: "acme", limit: { context: 200_000 } },
+                },
+                // No per-message usage: occupancy is genuinely unmeasurable.
+                [{ type: "user", text: "hello" }],
+            ),
+            "ses_test",
+        )
+
+        assert.ok(real, "measureSession must return a reading")
+        assert.strictEqual(
+            real!.usagePercent,
+            0,
+            `56.1M lifetime against a 200k window would read 100%; an unmeasurable ` +
+                `occupancy must be 0, not the lifetime counter (issue #11)`,
+        )
+        assert.strictEqual(
+            real!.promptTokens,
+            undefined,
+            "there is no prompt measurement to report, and none may be invented",
+        )
+        // The lifetime figure is still available — as the separate counter.
+        assert.strictEqual(real!.tokens, 57_000_000, "lifetime spend is still reported")
+    })
+
+    it("derives occupancy from promptTokens when a per-turn measurement exists", async () => {
+        const real = await measureSession(
+            measuringContext(
+                {
+                    tokens: { input: 57_000_000, output: 1_000_000 },
+                    cost: 1,
+                    model: { id: "test-model", providerID: "acme", limit: { context: 200_000 } },
+                },
+                [{ type: "user", text: "hello" }],
+            ),
+            "ses_test",
+            // The transcript is passed explicitly: `measureSession` reads the
+            // measurement from `messages`, not from `client.session.context`.
+            [
+                {
+                    type: "assistant",
+                    tokens: { input: 150_000, output: 500, cache: { read: 0, write: 0 } },
+                },
+            ],
+        )
+
+        assert.ok(real)
+        assert.strictEqual(real!.promptTokens, 150_000, "the prompt measurement is used verbatim")
+        assert.strictEqual(
+            real!.usagePercent,
+            75,
+            "occupancy is prompt against the window, never lifetime against the window",
+        )
+    })
+
+    it("keeps occupancy at 0 rather than the lifetime total for every magnitude", async () => {
+        // Guards against a future "close enough" fallback: the guard is on
+        // promptTokens being absent, not on the lifetime figure being large.
+        for (const lifetime of [0, 1, 1_000, 200_000, 56_100_000, 1e12]) {
+            const real = await measureSession(
+                measuringContext(
+                    {
+                        tokens: { input: lifetime, output: 0 },
+                        cost: 0,
+                        model: { id: "test-model", providerID: "acme", limit: { context: 200_000 } },
+                    },
+                    [{ type: "user", text: "hello" }],
+                ),
+                "ses_test",
+            )
+            assert.ok(real, `a reading for lifetime=${lifetime}`)
+            assert.strictEqual(
+                real!.usagePercent,
+                0,
+                `lifetime=${lifetime} with no per-turn usage must not produce occupancy`,
+            )
+        }
     })
 })

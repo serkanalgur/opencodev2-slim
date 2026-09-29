@@ -114,9 +114,13 @@ function unwrapModelList(raw: unknown): ModelLimitEntry[] {
 //      `default().data` — the exact window this session runs against;
 //   2. `default().data.limit.context` — the active model's own window, used when
 //      the list is empty or unavailable;
-//   3. any listed model with a sane window — last resort, may be the wrong model;
-//   4. DEFAULT_MODEL_LIMIT (200000) — safety net with a warning, never the
+//   3. DEFAULT_MODEL_LIMIT (200000) — safety net with a warning, never the
 //      normal path.
+//
+// There is deliberately NO "any other listed model" step: borrowing an
+// unrelated model's window makes every percentage describe a model we are not
+// running (GitHub issue #11 — a 128k model measured against another provider's
+// 1M window). A wrong-but-plausible window is worse than a loud default.
 //
 // Why it matters: percent thresholds resolve as `pct/100 * contextLimit`
 // (resolveThreshold → resolveCompressLimits). A 1M-window model now yields
@@ -167,18 +171,17 @@ export async function resolveModelContextLimit(ctx: any): Promise<number> {
     // 2) The active model's own window straight from `default().data`.
     if (defaultLimit !== undefined) return defaultLimit
 
-    // 3) Any model with a usable window beats a fabricated 200k.
-    for (const model of models) {
-        const limit = contextLimitOf(model)
-        if (limit !== undefined) return limit
-    }
-
-    // 4) Safety net — say so instead of pretending 200k is the real window.
+    // 3) Safety net — say so instead of pretending 200k is the real window.
     warnContextLimitFallback(defaultError, listError, sawDefault, sawList, models.length)
     return DEFAULT_MODEL_LIMIT
 }
 
 let warnedContextLimitFallback = false
+
+/** Clear the warn-once guard (test hook). */
+export function resetContextLimitFallbackWarning(): void {
+    warnedContextLimitFallback = false
+}
 
 /** One-shot notice: percent thresholds are meaningless while we run on the fake window. */
 function warnContextLimitFallback(
@@ -635,8 +638,10 @@ export default Plugin.define({
                         // `input + cache.read + cache.write` is the prompt size of ONE
                         // real request (cache.read is deliberately not accumulated across
                         // turns), so it — not the cumulative counter — answers "how full
-                        // is the window". buildPanelData falls back to `measured.tokens`
-                        // when the transcript carries no token info.
+                        // is the window". buildPanelData falls back to its own
+                        // transcript estimate (labelled "estimated") when the
+                        // transcript carries no token info — never to
+                        // `measured.tokens`, the lifetime spend counter.
                         //
                         // Same function as the request pipeline (usage.ts), so the panel
                         // and the auto-compress trigger can never disagree: backwards

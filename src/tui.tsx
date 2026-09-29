@@ -6,6 +6,7 @@ import { loadConfig, resolveCompressLimits } from "./lib/config"
 // the TUI surface cannot drift from them.
 import { findLastCompactionIndex, readMeasuredUsage } from "./lib/usage"
 import type { SessionState } from "./lib/types"
+import { PLUGIN_VERSION } from "./lib/version"
 
 /**
  * The TUI plugin context. It exposes the v2 `client` (an `OpenCodeClient`)
@@ -149,7 +150,10 @@ function resolveThresholds(real?: MeasuredReal | null): ResolvedThresholds {
     const state: SessionState = {
         sessionId: "",
         modelContextLimit: real?.contextLimit ?? 0,
-        currentTokenCount: real?.tokens ?? 0,
+        // Occupancy, never spend: the lifetime counter has no business here.
+        // (resolveCompressLimits itself only reads modelContextLimit, so this is
+        // about not leaving a lifetime figure in a field named "current".)
+        currentTokenCount: real?.promptTokens ?? 0,
         compressionCount: 0,
         lastCompressionTime: 0,
         manualMode: false,
@@ -194,7 +198,25 @@ function renderPanelText(
 ): string {
     const limit = real?.contextLimit ?? 0
     const pct = real?.usagePercent ?? 0
-    const status = real ? (pct >= 90 ? "critical" : pct >= 70 ? "warning" : "healthy") : "n/a"
+    // Occupancy is only known when the transcript carried per-message usage;
+    // without it `usagePercent` is 0, which would read as a confident "healthy".
+    const hasPrompt = !!real && real.promptTokens !== undefined && real.promptTokens !== null
+    // The STATUS is derived from a clamped copy of the percent (mirroring
+    // `buildPanelData` in src/lib/tui.ts): `usagePercent` is left unclamped as
+    // real information, but "critical" must only ever mean "the window is
+    // full", never "some non-window quantity is large". Without a measurement
+    // there is nothing to derive from, so the status is "n/a" — the branch that
+    // would render it is only taken when `hasPrompt` is true anyway.
+    const statusPct = Math.min(100, Math.max(0, pct))
+    const status = !real
+        ? "n/a"
+        : !hasPrompt
+          ? "unknown"
+          : statusPct >= 90
+            ? "critical"
+            : statusPct >= 70
+              ? "warning"
+              : "healthy"
     // F5: README promises the resolved threshold (token count + % of window).
     const trigger = thresholds ? renderTriggerLine(thresholds, limit) : null
     const lines: string[] = []
@@ -215,8 +237,8 @@ function renderPanelText(
         lines.push("├─────────────────────────────────────────────────────────────┤")
         // Two different quantities, never mixed (mirrors `renderPanel` in
         // src/lib/tui.ts): Context = the current prompt size, Lifetime = the
-        // session's cumulative spend.
-        const hasPrompt = real.promptTokens !== undefined && real.promptTokens !== null
+        // session's cumulative spend. `hasPrompt` was computed above, next to
+        // the status derivation it gates.
         if (hasPrompt) {
             // Context = the last request's `input + cache.read + cache.write`
             // (readMeasuredUsage), i.e. exactly what the `panel` tool shows as
@@ -236,12 +258,14 @@ function renderPanelText(
         } else {
             // No per-turn usage in the transcript, so the only figure available
             // is Session.Info.tokens' LIFETIME cumulative counter. It is spend,
-            // not occupancy: keep the legacy line for compatibility but qualify
-            // it immediately with a warning so it cannot be mistaken for window
-            // fill.
-            lines.push(`│ Measured tokens: ${real.tokens}  (${pct}% of ${limit})  [${status}]`)
+            // not occupancy: print NO percent and NO status next to it — `pct` is
+            // 0 here because occupancy is unknown, and pairing a lifetime number
+            // with a window percentage is precisely the conflation of issue #11.
+            // One line says both things (what the number is, and that the fill
+            // cannot be derived from it); `formatTokens` keeps it inside the
+            // 63-column frame even at 56.1M.
             lines.push(
-                `│ Lifetime cumulative — NOT context size (no per-turn usage in transcript)`,
+                `│ Lifetime: ${formatTokens(real.tokens)} tokens (cumulative spend, fill unknown)`,
             )
         }
         if (trigger) lines.push(trigger)
@@ -266,7 +290,7 @@ function resolveCurrentSession(context: PluginContext): string | null {
 
 // Server-measured context numbers for a session (Session.Info.tokens + cost + model),
 // mirroring what the `panel` tool in index.ts reads via ctx.session.get().
-interface MeasuredReal {
+export interface MeasuredReal {
     /**
      * LIFETIME CUMULATIVE token counter (Session.Info.tokens summed across every
      * usage event). `cache.read` re-reads the whole context each turn, so this
@@ -279,8 +303,9 @@ interface MeasuredReal {
      * `input + cache.read + cache.write`, read from the transcript via
      * `readMeasuredUsage` (src/lib/usage.ts) — the same figure the `panel` tool
      * shows as `Context`. Optional: only a transcript carrying per-message token
-     * info provides it; when absent the panel degrades to `tokens`, labelled as
-     * the cumulative counter so it is never read as occupancy.
+     * info provides it; when absent the panel reports `tokens` on a separately
+     * labelled Lifetime line with no percent and no status, so the cumulative
+     * counter is never read as occupancy.
      */
     promptTokens?: number
     cost: number
@@ -291,7 +316,15 @@ interface MeasuredReal {
     usagePercent: number
 }
 
-async function measureSession(
+/**
+ * Exported for tests only. The rendered surfaces all gate the occupancy
+ * figure on `hasPrompt`, so the `contextTokens` fallback below is
+ * unobservable from outside: a test that only reads /panel, /status or
+ * /compress cannot tell `promptTokens ?? 0` from `promptTokens ?? lifetime`.
+ * Exporting the function lets the fallback be pinned directly. Not used by
+ * any production code path.
+ */
+export async function measureSession(
     context: PluginContext,
     sessionID: string,
     messages?: readonly unknown[],
@@ -321,10 +354,13 @@ async function measureSession(
         try {
             const modelList: any = await context.client.model.list()
             const models: any[] = modelList?.data ?? modelList ?? []
-            // Find by exact match (providerID/modelID), then by modelID alone
+            // EXACT providerID+modelID only. A modelID-only fallback still
+            // borrows another model's window whenever two providers expose the
+            // same modelID (issue #11), and any "first model with a limit" pick
+            // is worse still — the default below is honest about not knowing.
             const found = models.find(
                 (m: any) => m.providerID === providerID && m.modelID === modelID,
-            ) || models.find((m: any) => m.modelID === modelID)
+            )
             if (found?.limit?.context && found.limit.context > 0) {
                 contextLimit = found.limit.context
             }
@@ -343,17 +379,22 @@ async function measureSession(
         // `afterIndex` is the last COMPLETED compaction — usage recorded before
         // it describes a prompt that no longer exists. Available only when the
         // caller hands us the transcript (the /panel, /status and /compress
-        // commands all do); otherwise the panel degrades to the lifetime
-        // counter and says so.
+        // commands all do); without it, and when the transcript carries no
+        // per-message usage, occupancy is unknown — `usagePercent` is 0 and the
+        // renderers say so rather than substituting the lifetime counter.
         let promptTokens: number | undefined
         if (messages) {
             const usage = readMeasuredUsage(messages, findLastCompactionIndex(messages))
             if (usage) promptTokens = usage.promptTokens
         }
 
-        // Occupancy is the prompt size when we have it; the cumulative counter is
-        // only ever a fallback, never the headline.
-        const contextTokens = promptTokens ?? lifetimeTokens
+        // Occupancy is the prompt size, and ONLY the prompt size. There is no
+        // `?? lifetimeTokens` fallback: a session-wide spend counter has no
+        // business filling the window, and using one is what made issue #11
+        // report 100% on a nearly empty session. With no per-turn usage in the
+        // transcript the honest answer is "unknown" (0), which the renderers
+        // label as such.
+        const contextTokens = promptTokens ?? 0
         const usagePercent =
             contextLimit > 0 ? Math.min(100, Math.round((contextTokens / contextLimit) * 100)) : 0
         return {
@@ -524,8 +565,9 @@ export default Plugin.define({
                                                 sessionID,
                                             })) ?? []
                                     } catch {
-                                        // Transcript unavailable: fall back to the
-                                        // lifetime counter, labelled as cumulative.
+                                        // Transcript unavailable: report from the
+                                        // empty transcript, so occupancy comes back
+                                        // UNKNOWN rather than being guessed at.
                                     }
                                     const real = await measureSession(
                                         context,
@@ -539,7 +581,7 @@ export default Plugin.define({
                                     const statusLine = real
                                         ? hasPrompt
                                             ? `Context ${real.promptTokens!.toLocaleString()} tokens (${real.usagePercent}% of ${real.contextLimit.toLocaleString()}) · Lifetime ${real.tokens.toLocaleString()} tokens (cumulative spend, NOT context size)`
-                                            : `${real.tokens.toLocaleString()} tokens (${real.usagePercent}% of ${real.contextLimit.toLocaleString()}) — lifetime cumulative, NOT context size`
+                                            : `${real.tokens.toLocaleString()} tokens — lifetime cumulative spend, NOT context size (window fill unknown without per-turn usage)`
                                         : "unknown"
 
                                     const text = [
@@ -632,8 +674,9 @@ export default Plugin.define({
                                                 sessionID,
                                             })) ?? []
                                     } catch {
-                                        // Transcript unavailable: fall back to the
-                                        // lifetime counter, labelled as cumulative.
+                                        // Transcript unavailable: report from the
+                                        // empty transcript, so the status comes back
+                                        // UNKNOWN rather than being guessed at.
                                     }
                                     const real = await measureSession(
                                         context,
@@ -649,16 +692,38 @@ export default Plugin.define({
                                         return
                                     }
 
-                                    const status =
-                                        real.usagePercent >= 90
-                                            ? "🔴 CRITICAL"
-                                            : real.usagePercent >= 70
-                                              ? "🟡 WARNING"
-                                              : "🟢 HEALTHY"
-
+                                    // Occupancy is only knowable when the transcript
+                                    // carried per-message usage. `measureSession`
+                                    // derives usagePercent from the prompt size and
+                                    // reports 0 when there is no measurement at all,
+                                    // so deriving a status from it unconditionally
+                                    // printed a false "🟢 HEALTHY" on a session whose
+                                    // real occupancy is simply unknown — as bad as the
+                                    // false "🔴 CRITICAL" the lifetime fallback used to
+                                    // produce, and worse: a false all-clear. Derive the
+                                    // status from hasPrompt instead.
                                     const hasPrompt =
                                         real.promptTokens !== undefined &&
                                         real.promptTokens !== null
+                                    // Three states, matching /panel and /compress:
+                                    //   - measured  → thresholds on the clamped percent.
+                                    //   - no measurement → UNKNOWN; never a confident
+                                    //     HEALTHY/WARNING/CRITICAL we cannot support.
+                                    // (There is no third "estimate available" state
+                                    // here: /status reports only server-side figures.)
+                                    // Clamped copy, same rule as `renderPanelText`
+                                    // and `buildPanelData`: the raw percent stays
+                                    // unclamped as real information, the status must
+                                    // only mean "the window is full".
+                                    const statusPct = Math.min(100, Math.max(0, real.usagePercent))
+                                    const status = !hasPrompt
+                                        ? "⚪ UNKNOWN"
+                                        : statusPct >= 90
+                                          ? "🔴 CRITICAL"
+                                          : statusPct >= 70
+                                            ? "🟡 WARNING"
+                                            : "🟢 HEALTHY"
+
                                     // Context = prompt, Lifetime = cumulative spend.
                                     // The no-prompt fallback keeps the `**Usage:**`
                                     // label callers/tests key on, but explicitly
@@ -673,7 +738,9 @@ export default Plugin.define({
                                                   : []),
                                           ]
                                         : [
-                                              `**Usage:** ${real.tokens.toLocaleString()} / ${real.contextLimit.toLocaleString()} tokens (${real.usagePercent}%) — lifetime cumulative, NOT context size`,
+                                              // No per-turn usage, so occupancy is unknown:
+                                              // never print the lifetime counter against the window.
+                                              `**Usage:** ${real.tokens.toLocaleString()} tokens — lifetime cumulative, NOT context size`,
                                           ]
 
                                     const text = [
@@ -784,7 +851,7 @@ export default Plugin.define({
         })
 
         context.ui.toast.show({
-            title: "Slim Plugin v2.1.0",
+            title: `Slim Plugin v${PLUGIN_VERSION}`,
             message: "Commands: /panel, /compress, /status, /slim-debug",
             variant: "success",
             duration: 4000,

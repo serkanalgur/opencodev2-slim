@@ -7,8 +7,8 @@ import { resolveCompressLimits } from "./config"
 /**
  * Where the panel's headline `currentTokens` figure actually came from.
  * - `"measured"`  — the server's own report: the last assistant turn's usage
- *   (session.step.ended / per-message `tokens`), or the session's reported
- *   token counter when no per-message figure exists. Exact for that request.
+ *   (session.step.ended / per-message `tokens`). Exact for that request, and
+ *   only ever claimed when that per-call prompt measurement actually exists.
  * - `"estimated"` — our character-count approximation of the prompt (system
  *   prompt + tool schemas + message content). A magnitude, NOT an exact count.
  */
@@ -131,8 +131,10 @@ export interface MeasuredContext {
      * CURRENT PROMPT SIZE: `input + cache.read + cache.write` of the latest
      * assistant turn, i.e. exactly what that one request sent. Optional because
      * only a transcript carrying per-message token info can provide it; when it
-     * is missing the panel falls back to `tokens` (cumulative) and the renderer
-     * clamps the bar, so a stale/absent prompt measurement can never crash.
+     * is missing `buildPanelData` uses the transcript estimate for the headline
+     * and labels the source "estimated", and never substitutes `tokens` — a
+     * lifetime spend counter must never stand in for window occupancy
+     * (GitHub issue #11).
      */
     promptTokens?: number
     /** Real total spend for this session (Session.Info.cost). */
@@ -226,26 +228,27 @@ export async function buildPanelData(
     tokensByRole.tools = Math.max(tokensByRole.tools, 0)
     tokensByRole.system = Math.max(0, currentTokens - tokensByRole.user - tokensByRole.assistant - tokensByRole.tools)
     
-    // Prefer the server-measured real token count for the headline usage figure.
     // Role buckets remain our estimate for breakdown detail.
     //
     // Headline priority — "context fullness" must describe the prompt we are
     // about to send, not everything ever spent:
     //   1. `measured.promptTokens` — last assistant turn's input + cache.read +
     //      cache.write: the true size of one outgoing request.
-    //   2. `measured.tokens` — Session.Info.tokens' LIFETIME CUMULATIVE total.
-    //      Fallback for callers that only supply it (it is still better than
-    //      nothing when the transcript has no token info), but it is a cost
-    //      counter and can exceed the window by orders of magnitude, which is
-    //      why renderPanel clamps the bar to 0..100 before String.repeat().
-    //   3. Our own per-message estimate from the transcript.
-    const effectiveTokens = measured?.promptTokens ?? measured?.tokens ?? currentTokens
+    //   2. Our own per-message estimate from the transcript.
+    //
+    // `measured.tokens` is deliberately NOT a fallback here. It is
+    // Session.Info.tokens' LIFETIME CUMULATIVE total (input+output+reasoning+
+    // cache.read+cache.write summed over the whole session) — a spend counter
+    // that exceeds the window by orders of magnitude and is what produced the
+    // bogus "100% critical" of GitHub issue #11. It is still reported, as
+    // `cumulativeTokens`, and rendered as a separately-labelled lifetime line.
+    const effectiveTokens = measured?.promptTokens ?? currentTokens
 
     // Label the headline with its provenance. Kept in lockstep with the
-    // `effectiveTokens` expression directly above: a measurement is used
-    // whenever the caller supplied a non-null prompt size OR a reported total,
-    // and only then is the figure "measured". Anything else is our transcript
-    // estimate — a magnitude the user must not read as exact.
+    // `effectiveTokens` expression directly above: "measured" is claimed only
+    // when the caller supplied a real per-call prompt size. Everything else —
+    // including a caller that supplied a lifetime total but no prompt size — is
+    // our transcript estimate, a magnitude the user must not read as exact.
     //
     // Scope note: this describes where the PANEL's own headline figure came
     // from, NOT which branch `resolveTriggerTokens` (src/lib/usage.ts) chose for
@@ -255,22 +258,24 @@ export async function buildPanelData(
     // rules. So "measured" here can coexist with an estimate-driven trigger;
     // the README states exactly this rather than promising they always agree.
     const hasPromptMeasurement = measured?.promptTokens !== undefined && measured?.promptTokens !== null
-    const hasReportedTotal = measured?.tokens !== undefined && measured?.tokens !== null
-    const tokenSource: PanelTokenSource =
-        hasPromptMeasurement || hasReportedTotal ? "measured" : "estimated"
+    const tokenSource: PanelTokenSource = hasPromptMeasurement ? "measured" : "estimated"
     
     // Usage % shown to the user is relative to the real model context window
     // (e.g. 220k / 1M = 22%), matching what OpenCode's own UI displays. The
     // configured maxTokens (a percentage of that same window) drives nudge/compress.
-    // Deliberately NOT clamped to 100 here: >100% is real information (a
-    // cumulative or over-window figure) that callers may want to inspect.
-    // renderPanel clamps before rendering the bar. Non-finite inputs (e.g. a
-    // zero window) are normalised to 0 so status/recommendations stay sane.
+    // Deliberately NOT clamped to 100 here: >100% is real information (an
+    // over-window figure) that callers may want to inspect, and renderPanel
+    // clamps before rendering the bar. Non-finite inputs (e.g. a zero window)
+    // are normalised to 0 so status/recommendations stay sane.
     const rawPercent = modelContextLimit > 0 ? (effectiveTokens / modelContextLimit) * 100 : 0
     const usagePercent = Number.isFinite(rawPercent) ? rawPercent : 0
+    // The STATUS is clamped even though `usagePercent` is not: "critical" is a
+    // claim that the window is full, and the thresholds above must agree with
+    // the unclamped-percent comment, so they compare a 0..100 copy instead.
+    const statusPercent = Math.min(100, Math.max(0, usagePercent))
     let status: "healthy" | "warning" | "critical" = "healthy"
-    if (usagePercent > 90) status = "critical"
-    else if (usagePercent > 70) status = "warning"
+    if (statusPercent > 90) status = "critical"
+    else if (statusPercent > 70) status = "warning"
     
     // Compression stats
     const compressionCount = state.compressionCount
