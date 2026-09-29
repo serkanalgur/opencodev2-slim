@@ -299,6 +299,10 @@ never executed, the default is now `enabled: false`.
   check that losing those long input values does not break anything you rely on
   for error recovery — a failed call is exactly the one you may want to re-read.
 
+The purge and the [Tool-pair guard](#tool-pair-guard) both act on
+`event.messages` in the same context hook, so enabling one does not leave the
+other passive: whatever the guard is protecting, the purge is rewriting.
+
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `purgeErrors.enabled` | `false` | Master switch. Opt-in after 3.0.2. |
@@ -325,6 +329,12 @@ The summary itself is injected as a `role:"user"` message wrapped in a
 `<conversation-checkpoint>` envelope, so the model can see where the replaced
 range began and ended. The tags are part of what your model reads on every
 compressed turn — mention them if you need to.
+
+Nothing the guard does can be undone by the
+[Purge-errors migration](#purge-errors-migration), because that one rewrites
+`input` values in place and never removes a message — it leaves every pairing
+intact. Order only matters when you are debugging: the guard runs first, on the
+unpurged messages.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
