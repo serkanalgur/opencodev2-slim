@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 400" width="1200" height="400">
+  <title>OpenCode Slim — smart context management for OpenCode v2</title>
+
+  <!-- Animation opt-out: SMIL is suppressed when the viewer asks for reduced motion. -->
+  <style>
+    @media (prefers-reduced-motion: reduce) {
+      .anim { display: none; }
+    }
+  </style>
+
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f0f23;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#1a1a3e;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0d0d1a;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#6366f1;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#8b5cf6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#a855f7;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="sliverGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#6366f1;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#a855f7;stop-opacity:1" />
+    </linearGradient>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur" />
+      <feMerge>
+        <feMergeNode in="coloredBlur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+
+    <!-- One dense context line, reused and scaled to build the "before" block. -->
+    <rect id="ctxLine" width="340" height="6" rx="3" />
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="400" fill="url(#bgGrad)" />
+
+  <!-- Grid pattern -->
+  <g opacity="0.05" stroke="#6366f1" stroke-width="1">
+    <line x1="0" y1="50" x2="1200" y2="50" />
+    <line x1="0" y1="100" x2="1200" y2="100" />
+    <line x1="0" y1="150" x2="1200" y2="150" />
+    <line x1="0" y1="200" x2="1200" y2="200" />
+    <line x1="0" y1="250" x2="1200" y2="250" />
+    <line x1="0" y1="300" x2="1200" y2="300" />
+    <line x1="0" y1="350" x2="1200" y2="350" />
+    <line x1="100" y1="0" x2="100" y2="400" />
+    <line x1="200" y1="0" x2="200" y2="400" />
+    <line x1="300" y1="0" x2="300" y2="400" />
+    <line x1="400" y1="0" x2="400" y2="400" />
+    <line x1="500" y1="0" x2="500" y2="400" />
+    <line x1="600" y1="0" x2="600" y2="400" />
+    <line x1="700" y1="0" x2="700" y2="400" />
+    <line x1="800" y1="0" x2="800" y2="400" />
+    <line x1="900" y1="0" x2="900" y2="400" />
+    <line x1="1000" y1="0" x2="1000" y2="400" />
+    <line x1="1100" y1="0" x2="1100" y2="400" />
+  </g>
+
+  <!-- Before: oversized context window, 25 packed token lines -->
+  <g transform="translate(70,152)" fill="#4338ca">
+    <rect x="-14" y="-16" width="368" height="226" rx="10" fill="#14142e" stroke="#6366f1" stroke-width="1" opacity="0.85" />
+    <use href="#ctxLine" transform="translate(0,0) scale(1.00,1)" opacity="0.90" />
+    <use href="#ctxLine" transform="translate(0,8) scale(0.86,1)" opacity="0.70" />
+    <use href="#ctxLine" transform="translate(0,16) scale(0.94,1)" opacity="0.80" />
+    <use href="#ctxLine" transform="translate(0,24) scale(0.72,1)" opacity="0.60" />
+    <use href="#ctxLine" transform="translate(0,32) scale(1.00,1)" opacity="0.85" />
+    <use href="#ctxLine" transform="translate(0,40) scale(0.62,1)" opacity="0.55" />
+    <use href="#ctxLine" transform="translate(0,48) scale(0.90,1)" opacity="0.75" />
+    <use href="#ctxLine" transform="translate(0,56) scale(0.78,1)" opacity="0.65" />
+    <use href="#ctxLine" transform="translate(0,64) scale(0.98,1)" opacity="0.85" />
+    <use href="#ctxLine" transform="translate(0,72) scale(0.68,1)" opacity="0.60" />
+    <use href="#ctxLine" transform="translate(0,80) scale(0.84,1)" opacity="0.70" />
+    <use href="#ctxLine" transform="translate(0,88) scale(1.00,1)" opacity="0.90" />
+    <use href="#ctxLine" transform="translate(0,96) scale(0.55,1)" opacity="0.50" />
+    <use href="#ctxLine" transform="translate(0,104) scale(0.88,1)" opacity="0.72" />
+    <use href="#ctxLine" transform="translate(0,112) scale(0.74,1)" opacity="0.62" />
+    <use href="#ctxLine" transform="translate(0,120) scale(0.96,1)" opacity="0.82" />
+    <use href="#ctxLine" transform="translate(0,128) scale(0.66,1)" opacity="0.58" />
+    <use href="#ctxLine" transform="translate(0,136) scale(0.92,1)" opacity="0.76" />
+    <use href="#ctxLine" transform="translate(0,144) scale(0.70,1)" opacity="0.60" />
+    <use href="#ctxLine" transform="translate(0,152) scale(1.00,1)" opacity="0.90" />
+    <use href="#ctxLine" transform="translate(0,160) scale(0.60,1)" opacity="0.52" />
+    <use href="#ctxLine" transform="translate(0,168) scale(0.82,1)" opacity="0.70" />
+    <use href="#ctxLine" transform="translate(0,176) scale(0.94,1)" opacity="0.80" />
+    <use href="#ctxLine" transform="translate(0,184) scale(0.72,1)" opacity="0.62" />
+    <use href="#ctxLine" transform="translate(0,192) scale(0.90,1)" opacity="0.75" />
+  </g>
+  <!-- Compression funnel: dashed, animated flow from the dense block into the sliver -->
+  <g stroke="#8b5cf6" stroke-width="2" fill="none" opacity="0.85">
+    <path d="M 424 190 L 726 232" stroke-dasharray="5,5">
+      <animate class="anim" attributeName="stroke-dashoffset" from="0" to="10" dur="1.4s" repeatCount="indefinite" />
+    </path>
+    <path d="M 424 210 L 726 240" stroke-dasharray="5,5">
+      <animate class="anim" attributeName="stroke-dashoffset" from="0" to="10" dur="1.6s" repeatCount="indefinite" />
+    </path>
+    <path d="M 424 250 L 726 248" stroke-dasharray="5,5">
+      <animate class="anim" attributeName="stroke-dashoffset" from="0" to="10" dur="1.8s" repeatCount="indefinite" />
+    </path>
+    <path d="M 424 290 L 726 256" stroke-dasharray="5,5">
+      <animate class="anim" attributeName="stroke-dashoffset" from="0" to="10" dur="1.5s" repeatCount="indefinite" />
+    </path>
+    <path d="M 424 330 L 726 264" stroke-dasharray="5,5">
+      <animate class="anim" attributeName="stroke-dashoffset" from="0" to="10" dur="1.7s" repeatCount="indefinite" />
+    </path>
+  </g>
+
+  <!-- Compression core: soft-glow diamond on the funnel throat -->
+  <g filter="url(#softGlow)">
+    <circle cx="575" cy="248" r="26" fill="url(#accentGrad)" opacity="0.35">
+      <animate class="anim" attributeName="r" values="26;31;26" dur="2.6s" repeatCount="indefinite" />
+    </circle>
+    <text x="575" y="253" text-anchor="middle" fill="#ffffff" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="700">Slim</text>
+  </g>
+
+  <!-- After: same window, few clean lines + an accounted-for sliver -->
+  <g transform="translate(740,168)">
+    <rect x="-14" y="-16" width="368" height="130" rx="10" fill="#14142e" stroke="#a855f7" stroke-width="1" opacity="0.85" />
+    <g fill="#a855f7">
+      <use href="#ctxLine" transform="translate(0,0) scale(1,1)" opacity="0.95" />
+      <use href="#ctxLine" transform="translate(0,14) scale(0.7,1)" opacity="0.85" />
+      <use href="#ctxLine" transform="translate(0,28) scale(0.46,1)" opacity="0.8" />
+      <use href="#ctxLine" transform="translate(0,42) scale(0.26,1)" opacity="0.75" />
+    </g>
+    <text x="0" y="76" fill="#94a3b8" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12" font-weight="500">semantic compression · pruning</text>
+
+    <!-- Remaining window vs. trimmed -->
+    <rect x="0" y="88" width="340" height="8" rx="4" fill="#1e293b" />
+    <rect x="0" y="88" width="34" height="8" rx="4" fill="url(#sliverGrad)">
+      <animate class="anim" attributeName="width" values="34;46;34" dur="3.2s" repeatCount="indefinite" />
+    </rect>
+  </g>
+
+  <!-- Stats panel -->
+  <g transform="translate(740,336)">
+    <text x="0" y="0" fill="#818cf8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="600">24 lines in</text>
+    <text x="150" y="0" fill="#a855f7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="600">4 lines out</text>
+    <text x="266" y="0" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="500">~83% trimmed</text>
+  </g>
+
+  <!-- Main title -->
+  <text x="600" y="80" text-anchor="middle" fill="#ffffff" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="48" font-weight="800" letter-spacing="-1">OpenCode Slim</text>
+  <text x="600" y="115" text-anchor="middle" fill="#94a3b8" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="17" font-weight="400">Smart context management for OpenCode v2 — semantic compression, cost-aware pruning, adaptive thresholds</text>
+
+  <!-- Bottom bar -->
+  <rect x="0" y="380" width="1200" height="20" fill="#0f0f23" opacity="0.8" />
+  <text x="600" y="395" text-anchor="middle" fill="#818cf8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="500">@serkanalgur/opencodev2-slim • MIT License</text>
+</svg>

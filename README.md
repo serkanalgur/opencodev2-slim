@@ -1,9 +1,25 @@
-# opencodev2-slim
+# OpenCode Slim
 
-[![npm version](https://img.shields.io/npm/v/@serkanalgur/opencodev2-slim.svg)](https://www.npmjs.com/package/@serkanalgur/opencodev2-slim)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+<div align="center">
 
-Smart context management plugin for OpenCode v2. Optimizes token usage through semantic compression, cost-aware pruning, and adaptive thresholds.
+<img src="./assets/banner.svg" alt="OpenCode Slim" width="100%" />
+
+[![npm version](https://img.shields.io/npm/v/@serkanalgur/opencodev2-slim?style=flat-square&color=6366f1)](https://www.npmjs.com/package/@serkanalgur/opencodev2-slim)
+[![npm downloads](https://img.shields.io/npm/dw/@serkanalgur/opencodev2-slim?style=flat-square&color=22c55e)](https://www.npmjs.com/package/@serkanalgur/opencodev2-slim)
+[![stars](https://img.shields.io/github/stars/serkanalgur/opencodev2-slim?style=flat-square&color=f59e0b)](https://github.com/serkanalgur/opencodev2-slim/stargazers)
+[![license](https://img.shields.io/npm/l/@serkanalgur/opencodev2-slim?style=flat-square&color=8b5cf6)](https://github.com/serkanalgur/opencodev2-slim/blob/main/LICENSE)
+[![Socket Badge](https://badge.socket.dev/npm/package/@serkanalgur/opencodev2-slim/latest)](https://socket.dev/npm/package/@serkanalgur/opencodev2-slim/overview)
+[![opencode](https://img.shields.io/badge/OpenCode-V2-6366f1?style=flat-square)](https://opencode.ai)
+[![typescript](https://img.shields.io/badge/TypeScript-5.7%2B-3178c6?style=flat-square)](https://www.typescriptlang.org/)
+[![sponsor](https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?style=flat-square&logo=github)](https://github.com/sponsors/serkanalgur)
+
+**Smart context management plugin for OpenCode v2 — semantic compression, cost-aware pruning, adaptive thresholds**
+
+[Installation](#installation) • [Usage](#usage) • [Features](#features) • [Configuration](#configuration) • [How It Works](#how-it-works) • [Commands](#commands) • [Changelog](#changelog)
+
+</div>
+
+---
 
 ## Features
 
@@ -323,6 +339,36 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 3.0.1
+
+**FIXES**
+
+- The context window is no longer resolved by borrowing an arbitrary model's
+  limit. When the active model is not found in the model list, the resolver no
+  longer falls back to "the first listed model with any limit"; it now uses the
+  active model's `default()` limit and, failing that, the documented
+  `DEFAULT_MODEL_LIMIT` with a warning. A usage percentage computed against
+  another model's context window is meaningless. The TUI's resolver was
+  tightened the same way, from a modelID-only match to an exact
+  providerID+modelID match.
+- The panel and TUI no longer fall back to the lifetime-cumulative token counter
+  when showing how full the context window is. When the transcript carries no
+  per-call prompt measurement, the displayed occupancy now falls back to our own
+  per-message transcript estimate rather than the session's cumulative total —
+  which grows every turn, because `cache.read` re-reads the whole context, and
+  which therefore produced bogus "100% critical" readings. The cumulative figure
+  is still reported where it is legitimate (as lifetime spend/cost) and is still
+  explicitly labelled as not being a context size. The `status`/`CRITICAL`
+  derivation is now clamped to 0..100.
+- The welcome toast no longer reports a stale version. The `Slim Plugin vX.Y.Z`
+  title was a hardcoded literal that had drifted to `v2.1.0`; it is now derived
+  from a single `PLUGIN_VERSION` constant, guarded by a test that keeps it in
+  sync with `package.json`.
+
+**DOCS**
+
+- Refreshed the README: banner, badge row, and a `## Credits` section.
+
 ### 3.0.0
 
 **BREAKING CHANGES**
@@ -483,6 +529,10 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 ### 1.0.1
 
 - Initial release
+
+## Credits
+
+- [PrakharSrivastav](https://github.com/PrakharSrivastav) — reported [issue #11](https://github.com/serkanalgur/opencodev2-slim/issues/11), suggesting that a context window should not be resolved by borrowing an arbitrary model's limit, and that current context usage should be measured per model call rather than read off session lifetime totals. Both suggestions shipped in 3.0.1.
 
 ## License
 
