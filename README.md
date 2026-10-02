@@ -201,10 +201,58 @@ Create `~/.config/opencode/slim.jsonc`:
     },
     "persistence": {
         "enabled": true,
+        // Primary store is OpenCode's plugin storage, keyed per project.
+        // This directory is the migration source and fallback mirror, and is
+        // left in place after an upgrade — see "Session Persistence" below.
         "directory": "~/.config/opencode/slim"
     }
 }
 ```
+
+### Configuring with `opencode.jsonc` (plugin options)
+
+Instead of editing the machine-wide `slim.jsonc`, the plugin accepts options
+inline through the object form of the `plugins` array. This is what you want
+for per-project or per-checkout settings:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "@serkanalgur/opencodev2-slim",
+      "options": {
+        "compress": {
+          "maxContextLimit": "80%",
+          "minContextLimit": "40%"
+        },
+        "strategies": {
+          "pruneOutputs": { "enabled": true }
+        }
+      }
+    }
+  ]
+}
+```
+
+The `options` object uses exactly the same shape and keys as `slim.jsonc` — a
+partial override is merged, not replaced, so the keys you leave out keep their
+values from the file (and their built-in defaults where the file is silent).
+That includes `compress.modelMaxLimits` and `compress.modelMinLimits`, which
+merge per model key: an override naming one model leaves the others alone.
+
+**Precedence, lowest to highest:**
+
+1. built-in defaults
+2. `slim.jsonc` in the config directory
+3. the `options` object above
+
+Options win because they are the more specific statement of intent: they are
+written per project, while `slim.jsonc` is one machine-wide file. `slim.jsonc`
+remains the fallback for every key the options object does not mention, so you
+can keep shared defaults there and override only what differs per project.
+
+The whole feature is opt-in. With no `options` key present, behaviour is
+unchanged.
 
 ### Context thresholds
 
@@ -413,7 +461,30 @@ The plugin learns from your compression patterns and adjusts thresholds over tim
 
 ### Session Persistence
 
-State is saved to disk, so compression history and learning persist across restarts.
+State is saved so compression history and learning persist across restarts.
+
+State now lives in OpenCode's plugin storage (`ctx.storage`) rather than a
+single machine-wide directory, and is keyed by project directory. Two
+checkouts on one machine no longer share one flat store, so a session in one
+project cannot collide with a same-named session in another.
+
+**Upgrading from an earlier version:** nothing to do. When slim starts and finds
+state for a session only in the old `~/.config/opencode/slim` directory, it
+loads that state, carries it into the new store, and continues from it — your
+compression history and adaptive thresholds survive the upgrade rather than
+resetting. The old files are copied forward and then left in place; slim never
+deletes them, so you can inspect or remove them yourself.
+
+Two details worth knowing if you tune this:
+
+- The old directory is still used as a fallback mirror, so state is recoverable
+  even if the storage write fails.
+- If the two copies ever disagree, slim resolves them by **which was written
+  last**, not by preferring one store. Both copies record when they were
+  written, so this works in either direction: running an older slim version
+  that writes only the file does not roll your state back, and a failed mirror
+  write that leaves storage ahead does not let a stale file overwrite it. The
+  losing copy is then brought up to date so they converge.
 
 ## Commands
 
@@ -427,6 +498,68 @@ State is saved to disk, so compression history and learning persist across resta
 Note: Compression is performed by the AI assistant using the `compress` tool. The slash command provides guidance on usage; it is the only slash command that writes to the session, and it does so with an explicit `delivery: "steer"` (see [Compress Tool](#compress-tool)).
 
 ## Changelog
+
+### 3.2.0
+
+**NEW**
+
+- Configuration can now be passed inline through the object form of the
+  `plugins` array in `opencode.jsonc`, instead of only through the machine-wide
+  `slim.jsonc`. The `options` object takes the same shape and keys as the file,
+  and a partial override is merged rather than replaced, so anything you leave
+  out keeps its value from the file and its built-in default. Precedence is
+  defaults, then `slim.jsonc`, then `options` — options win because they are
+  the per-project statement of intent. With no `options` key present, behaviour
+  is unchanged.
+- Session state now persists through OpenCode's plugin storage, keyed by
+  project directory. Previously every project on the machine shared one flat
+  directory, so two checkouts could collide on a same-named session.
+
+**MIGRATION**
+
+- No action is needed on upgrade. When slim finds state for a session only in
+  the old `~/.config/opencode/slim` directory, it loads that state, carries it
+  into the new store, and continues from it, so compression history and
+  adaptive thresholds survive rather than resetting. The old files are copied
+  forward and left in place — slim never deletes them, so you can inspect or
+  remove them yourself.
+- The old directory is retained as a fallback mirror, so state remains
+  recoverable if a storage write fails. If the two copies ever disagree, slim
+  resolves them by which was written last, not by preferring one store — so
+  neither running an older slim that writes only the file, nor a failed mirror
+  write, can roll your state back or lose the newer copy.
+
+**FIXES**
+
+- The context window now follows the model the request is actually running.
+  It was resolved once at startup from the default model and then held for the
+  session's whole life, so switching from a 200k model to a 1M model mid-session
+  left every percent threshold resolving against the 200k window — `"80%"`
+  fired at 160k on a model that could hold 800k. The window is now resolved from
+  each request's own model. Resolution only re-runs when the model actually
+  changes, and a model that cannot be resolved never borrows another model's
+  window; it keeps the last one it had.
+- A model id containing slashes (`openrouter/meta-llama/llama-3-70b-instruct`)
+  is now resolved instead of silently failing to match its own entry, which
+  left such a model measuring against the wrong window.
+- A transient failure while reading the model list no longer latches: the window
+  is re-resolved on a later request instead of staying wrong for the rest of
+  the session.
+- `compress.modelMaxLimits` and `compress.modelMinLimits` now merge per model
+  key instead of being replaced wholesale. Previously an override naming one
+  model discarded every other model's entry, and because a missing key falls
+  back to the global threshold, the affected models were quietly measured
+  against the wrong limit rather than failing visibly. This affected every
+  layer, so a partial override inside `slim.jsonc` was affected too.
+- `persistence.enabled: false` now stops all persistence again. When state
+  moved to plugin storage, the flag was checked after the storage write, so
+  turning persistence off stopped only the on-disk mirror while history kept
+  accumulating silently. It now gates both layers.
+- Session hooks are now disposed when the plugin unloads. Previously the
+  registrations were discarded, so a reload left the old callbacks attached to
+  the host and stacked a second copy of the compression pipeline onto them —
+  after N reloads, every request ran the pipeline N times. A dispose that
+  throws no longer strands the remaining hooks.
 
 ### 3.1.0
 
