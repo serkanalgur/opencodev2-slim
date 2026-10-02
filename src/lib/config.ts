@@ -87,6 +87,29 @@ const DEFAULT_CONFIG: SlimConfig = {
     },
 }
 
+/**
+ * Merge two per-model limit maps key by key.
+ *
+ * These are the only maps in the config, and the only ones that must merge
+ * per key rather than being taken from the higher-precedence layer wholesale.
+ * A user with limits for three models who adds an override for ONE of them —
+ * via `slim.jsonc`, or via the plugin `options` object — must not silently
+ * lose the other two. Replacing the whole map made a partial override look
+ * like it applied while quietly discarding everything it did not mention.
+ *
+ * `undefined` is preserved when neither layer has the key, so a config that
+ * never mentions per-model limits stays free of an empty object rather than
+ * gaining one.
+ */
+function mergePerModelLimits(
+    base?: Record<string, number | string>,
+    override?: Record<string, number | string>,
+): Record<string, number | string> | undefined {
+    if (!base) return override
+    if (!override) return base
+    return { ...base, ...override }
+}
+
 function deepMerge(base: SlimConfig, override: Partial<SlimConfig>): SlimConfig {
     return {
         ...base,
@@ -94,8 +117,15 @@ function deepMerge(base: SlimConfig, override: Partial<SlimConfig>): SlimConfig 
         compress: {
             ...base.compress,
             ...override.compress,
-            modelMaxLimits: override.compress?.modelMaxLimits ?? base.compress.modelMaxLimits,
-            modelMinLimits: override.compress?.modelMinLimits ?? base.compress.modelMinLimits,
+            // Merged per model key — see mergePerModelLimits.
+            modelMaxLimits: mergePerModelLimits(
+                base.compress.modelMaxLimits,
+                override.compress?.modelMaxLimits,
+            ),
+            modelMinLimits: mergePerModelLimits(
+                base.compress.modelMinLimits,
+                override.compress?.modelMinLimits,
+            ),
         },
         strategies: {
             deduplication: { ...base.strategies.deduplication, ...override.strategies?.deduplication },
@@ -127,7 +157,54 @@ function deepMerge(base: SlimConfig, override: Partial<SlimConfig>): SlimConfig 
     }
 }
 
-export function loadConfig(): SlimConfig {
+/**
+ * Options captured from the plugin context, held here rather than in the
+ * plugin entry point so that EVERY `loadConfig()` caller resolves the same
+ * values — the server pipeline and the TUI panel included.
+ *
+ * `null` when the user configured no options, which makes `loadConfig` behave
+ * exactly as it did before this existed.
+ */
+let pluginOptions: Record<string, unknown> | null = null
+
+/** Capture the options from the plugin context. Called once per plugin load. */
+export function setPluginOptions(options: unknown): void {
+    pluginOptions =
+        options && typeof options === "object" && !Array.isArray(options)
+            ? (options as Record<string, unknown>)
+            : null
+}
+
+/** Forget the captured options (test hook, and a reload with no options). */
+export function resetPluginOptions(): void {
+    pluginOptions = null
+}
+
+/**
+ * Load the effective configuration.
+ *
+ * Precedence, lowest to highest:
+ *   1. built-in defaults
+ *   2. `slim.jsonc` in the global config directory
+ *   3. plugin options from the `plugins` array in opencode.jsonc
+ *
+ * `options` wins over the file because it is the more specific, more local
+ * statement of intent: it is written per project and per plugin entry, while
+ * `slim.jsonc` is a single machine-wide file. This is also what makes the
+ * object form in opencode.jsonc useful —
+ *
+ *   "plugins": [{ "package": "@serkanalgur/opencodev2-slim",
+ *                 "options": { "compress": { "maxContextLimit": "80%" } } }]
+ *
+ * `slim.jsonc` therefore remains the fallback for anything the options object
+ * does not mention, and the whole feature is opt-in.
+ *
+ * `options` defaults to whatever the plugin context supplied, so callers that
+ * have no options of their own still pick them up — that is what keeps the
+ * panel and the pipeline reporting the same limits.
+ */
+export function loadConfig(options?: Record<string, unknown> | null): SlimConfig {
+    const effective = options === undefined ? pluginOptions : options
     let config = { ...DEFAULT_CONFIG }
 
     const globalDir = process.env.XDG_CONFIG_HOME
@@ -152,6 +229,17 @@ export function loadConfig(): SlimConfig {
             }
         } catch {
             // Use defaults
+        }
+    }
+
+    // Plugin options from opencode.jsonc, layered over the file. Anything that
+    // is not a plain object is ignored rather than merged: a malformed options
+    // value must not corrupt an otherwise valid config.
+    if (effective && typeof effective === "object" && !Array.isArray(effective)) {
+        try {
+            config = deepMerge(config, effective as Partial<SlimConfig>)
+        } catch {
+            // A malformed options object falls back to the file config.
         }
     }
 

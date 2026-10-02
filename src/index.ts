@@ -3,8 +3,23 @@ import {
     loadConfig,
     createDefaultConfig,
     resolveCompressLimits,
+    setPluginOptions,
 } from "./lib/config"
-import { loadSessionState, saveSessionState, addCompressionRecord, resetOnCompaction } from "./lib/state"
+import {
+    loadSessionState,
+    addCompressionRecord,
+    resetOnCompaction,
+    normalizeState,
+} from "./lib/state"
+import {
+    projectScopeKey,
+    sessionStateKey,
+    serializeState,
+    writtenAtOf,
+    readLegacyEntry,
+    writeLegacyPayload,
+    type SlimStorage,
+} from "./lib/persistence"
 import { countTokens, getMessageText, getToolResultContent } from "./lib/compress"
 import {
     estimatePromptTokens,
@@ -32,7 +47,13 @@ import {
 import { getSystemPrompt, getCompressToolDescription } from "./lib/prompts"
 import { buildPrunePlan, applyPrunePlan, type PruneStats } from "./lib/prune"
 import { buildPanelData, renderPanel } from "./lib/tui"
-import type { SlimConfig, SessionState, MessageWithParts, CompressionBlock } from "./lib/types"
+import type {
+    SlimConfig,
+    SessionState,
+    MessageWithParts,
+    CompressionBlock,
+    ToolCallInfo,
+} from "./lib/types"
 
 // ─── State Management ───────────────────────────────────────────────────────
 
@@ -55,16 +76,283 @@ const sessionsAwaitingCompactionCheck = new Set<string>()
 // the feature is off) and read only by the panel tool.
 const sessionPruneStats = new Map<string, PruneStats>()
 
-function getState(sessionId: string, config: SlimConfig): SessionState {
-    if (!sessionStates.has(sessionId)) {
-        const state = loadSessionState(sessionId, config.persistence.directory)
-        // Give every fresh state a real model limit when we know it
-        const knownLimit = sessionModelLimits.get(sessionId) || DEFAULT_MODEL_LIMIT
-        state.modelContextLimit = knownLimit
-        sessionStates.set(sessionId, state)
+/**
+ * Persistence backend for session state.
+ *
+ * `ctx.storage` is the v2 plugin-scoped store, so state is isolated per plugin
+ * instance and per project directory instead of sharing one global
+ * `~/.config/opencode/slim` directory across every checkout on the machine.
+ *
+ * Null when the host exposes no storage domain (older host, or a test harness)
+ * — callers then fall back to the legacy on-disk directory, which is also the
+ * migration source: a session found only on disk is loaded and written into
+ * storage on first use, so an upgrade keeps its compression history.
+ */
+let stateStorage: SlimStorage | null = null
+/** Project scope for storage keys, from `ctx.location.project.canonical`. */
+let projectScope = "global"
+
+/** Wire the storage backend at setup(). Called once per plugin load. */
+export function configurePersistence(ctx: any): void {
+    const storage = ctx?.storage
+    if (
+        storage &&
+        typeof storage.get === "function" &&
+        typeof storage.set === "function"
+    ) {
+        stateStorage = storage as SlimStorage
     }
+    const canonical = ctx?.location?.project?.canonical
+    projectScope = projectScopeKey(typeof canonical === "string" ? canonical : undefined)
+}
+
+/** Test hook: forget the storage backend and project scope. */
+export function resetPersistence(): void {
+    stateStorage = null
+    projectScope = "global"
+}
+
+/** True when state is being persisted through `ctx.storage`. */
+export function usingPluginStorage(): boolean {
+    return stateStorage !== null
+}
+
+/**
+ * Sessions whose storage read has failed.
+ *
+ * The distinction this preserves: "storage holds no entry" and "storage could
+ * not be read" are not the same answer. Collapsing them makes a transient read
+ * failure look like an empty store, so the stale mirror is adopted — and the
+ * next save then writes that stale state back over a storage copy that was
+ * never missing, only unreachable. A session in this set is written mirror-only
+ * until a read succeeds, so a failed read can never destroy newer state.
+ */
+const storageUnreachableSessions = new Set<string>()
+
+/** A loaded state payload plus whether the other layer is now stale. */
+interface LoadedState {
+    data: Record<string, unknown>
+    /**
+     * True when the two layers hold different versions and the losing one
+     * should be brought up to date. False when they agree, when only one layer
+     * exists, or when there is no storage backend to reconcile with.
+     */
+    needsReconcile: boolean
+}
+
+/**
+ * Load one session's state, choosing whichever copy was written LAST.
+ *
+ * Neither layer can be treated as authoritative on its own:
+ *
+ *  - Preferring the file unconditionally (the previous behaviour) loses data
+ *    whenever a storage write succeeded and the mirror write did not — the
+ *    stale file then wins and the write-forward overwrites the newer storage
+ *    copy, destroying it. `writeLegacyPayload` swallows its own errors, so
+ *    that failure is silent and self-inflicted.
+ *  - Preferring storage unconditionally loses data in the mirror image: the
+ *    user runs an older slim, which writes only the file.
+ *
+ * So both copies carry a write time and the newer one wins. Ties go to
+ * storage: on a clean save both are written from one payload with the same
+ * timestamp, so a tie means the two genuinely agree and either is correct.
+ *
+ * Returns `undefined` when neither layer has an entry, so the caller can build
+ * a fresh state. A corrupt entry at EITHER layer is treated as absent — a
+ * broken file must not wedge the session forever.
+ */
+async function loadStateFor(
+    sessionId: string,
+    config: SlimConfig,
+): Promise<LoadedState | undefined> {
+    const legacy = readLegacyEntry(sessionId, config.persistence.directory)
+
+    let stored: { data: Record<string, unknown>; writtenAt: number } | undefined
+    if (stateStorage) {
+        try {
+            const raw = await stateStorage.get(sessionStateKey(projectScope, sessionId))
+            // A successful read — even one returning nothing — proves storage
+            // is reachable, so any earlier outage is over.
+            storageUnreachableSessions.delete(sessionId)
+            if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+                const data = raw as Record<string, unknown>
+                // No marker means a payload written before recency tracking;
+                // treat it as the oldest possible rather than as current.
+                stored = { data, writtenAt: writtenAtOf(data) ?? Number.NEGATIVE_INFINITY }
+            }
+        } catch {
+            // Unreachable is NOT the same as empty. Record it so persistState
+            // skips the storage write for this session, then fall back to the
+            // mirror for reading.
+            storageUnreachableSessions.add(sessionId)
+        }
+    }
+
+    if (!legacy) return stored ? { data: stored.data, needsReconcile: false } : undefined
+    if (!stored) return { data: legacy.data, needsReconcile: false }
+
+    // Both layers exist. Adopt the newer and report whether the loser needs
+    // rewriting. A tie means the two agree (every clean save writes one
+    // payload to both), so there is nothing to reconcile.
+    if (legacy.writtenAt > stored.writtenAt) {
+        return { data: legacy.data, needsReconcile: true }
+    }
+    return {
+        data: stored.data,
+        // Strictly-newer storage over a stale mirror: refresh the file so the
+        // two stop disagreeing. This is the self-heal for a failed mirror
+        // write — without it the stale file lingers and would keep re-losing.
+        needsReconcile: stored.writtenAt > legacy.writtenAt,
+    }
+}
+
+/** Persist one session's state to storage, mirroring to disk as a fallback. */
+async function persistState(state: SessionState, config: SlimConfig): Promise<void> {
+    // `persistence.enabled: false` means the user opted out of persistence
+    // entirely. It has to gate BOTH layers: when the storage write ran first,
+    // switching the flag off stopped only the on-disk mirror while the
+    // session's compression history and tool-call map kept being written to
+    // plugin storage — so "off" persisted nothing visible but still accumulated
+    // state, and did so silently.
+    if (!config.persistence.enabled) return
+
+    // ONE payload for both layers, so both carry the same write time. Writing
+    // them separately would give each a slightly different timestamp, and the
+    // reader's recency comparison would then pick between two copies of the
+    // same state purely on sub-millisecond noise.
+    const payload = serializeState(state)
+
+    if (stateStorage && !storageUnreachableSessions.has(state.sessionId)) {
+        try {
+            await stateStorage.set(sessionStateKey(projectScope, state.sessionId), payload)
+        } catch {
+            // Write failed. Record the session as unreachable so subsequent
+            // saves go mirror-only instead of repeatedly attempting — and, more
+            // importantly, so nothing derived from a failed read is written
+            // back over a storage copy that may well be newer.
+            storageUnreachableSessions.add(state.sessionId)
+        }
+    }
+
+    // Kept as a safety mirror, not the primary store: it preserves the old
+    // behaviour for a host with no storage domain, and keeps a pre-migration
+    // copy readable rather than deleting user data on upgrade.
+    writeLegacyPayload(payload, state.sessionId, config.persistence.directory)
+}
+
+/**
+ * Get (and lazily hydrate) the state for a session.
+ *
+ * Async because hydration reads `ctx.storage`. Callers are all on async
+ * hook/tool paths, and they `await` this, so a cold session is fully hydrated
+ * before any of them acts on it — there is no window where a request runs
+ * against a half-loaded state.
+ *
+ * Concurrent first-callers share one read via `stateLoads`: without it, a
+ * session opened by two requests at once would fire two loads racing to
+ * populate the same cache entry, and the loser's state would be discarded
+ * mid-request.
+ */
+async function getState(sessionId: string, config: SlimConfig): Promise<SessionState> {
+    const cached = sessionStates.get(sessionId)
+    if (cached) return cached
+
+    const pending = stateLoads.get(sessionId)
+    if (pending) {
+        // Waiters get the SAME protection as the initiator. Without this, a
+        // rejecting hydrate throws out of whichever request happened to arrive
+        // second, even though the initiator already handled it and installed a
+        // default state — a persistence failure escalating into a hook failure.
+        try {
+            await pending
+        } catch {
+            // Fall through to the shared fallback below.
+        }
+        return sessionStates.get(sessionId)!
+    }
+
+    const load = (async () => {
+        const loaded = await loadStateFor(sessionId, config)
+        const state = hydrateState(sessionId, config, loaded?.data)
+        state.modelContextLimit = sessionModelLimits.get(sessionId) || DEFAULT_MODEL_LIMIT
+        sessionStates.set(sessionId, state)
+
+        // The two layers disagreed on which was written last. The copy now in
+        // memory is the newest, so write it to the other side and let them
+        // converge. This runs in BOTH directions — an upgrade that left the
+        // file ahead, and a failed mirror write that left storage ahead.
+        if (loaded?.needsReconcile) await persistState(state, config)
+    })()
+
+    stateLoads.set(sessionId, load)
+    try {
+        await load
+    } catch {
+        // A failed hydrate must never break the request; fall back to a default
+        // state so the pipeline still runs this turn.
+        if (!sessionStates.has(sessionId)) {
+            const fallback = loadSessionState(sessionId, config.persistence.directory)
+            fallback.modelContextLimit =
+                sessionModelLimits.get(sessionId) || DEFAULT_MODEL_LIMIT
+            sessionStates.set(sessionId, fallback)
+        }
+    } finally {
+        stateLoads.delete(sessionId)
+    }
+
     return sessionStates.get(sessionId)!
 }
+
+// ─── Hook Registration Lifetime ─────────────────────────────────────────────
+//
+// `ctx.session.hook()` returns a `Registration` that must be disposed when the
+// plugin unloads. Discarding it leaves the callbacks attached to the host
+// across a reload, so a config reload would stack a second copy of the whole
+// compression pipeline onto the same hooks — every request then running the
+// DCP pipeline N times.
+const hookRegistrations: { dispose(): Promise<void> }[] = []
+
+/** In-flight hydrations, so concurrent first-callers await one read. */
+const stateLoads = new Map<string, Promise<void>>()
+
+/** Turn a raw stored payload into a validated, in-memory state. */
+function hydrateState(
+    sessionId: string,
+    config: SlimConfig,
+    stored: Record<string, unknown> | undefined,
+): SessionState {
+    if (!stored) return loadSessionState(sessionId, config.persistence.directory)
+
+    // Start from the on-disk load so every default and the normalization rules
+    // (dropping malformed blocks, the monotonic nextBlockId floor) still apply,
+    // then overlay what storage holds.
+    return normalizeState({
+        ...loadSessionState(sessionId, config.persistence.directory),
+        ...(stored as Partial<SessionState>),
+        toolCalls: new Map(
+            Array.isArray(stored.toolCalls) ? (stored.toolCalls as [string, ToolCallInfo][]) : [],
+        ),
+        sessionId,
+    })
+}
+
+/**
+ * Options passed through the `plugins` array in opencode.jsonc:
+ *
+ *   "plugins": [{ "package": "@serkanalgur/opencodev2-slim",
+ *                 "options": { "compress": { "maxContextLimit": "80%" } } }]
+ *
+ * The captured options live in `./lib/config` so that every `loadConfig()`
+ * caller resolves the same values — the TUI panel included. Storing them here
+ * instead would make the panel display limits the pipeline does not enforce.
+ */
+
+/** Capture the plugin options at setup(). Called once per plugin load. */
+export function configurePluginOptions(ctx: any): void {
+    setPluginOptions(ctx?.options)
+}
+
+export { resetPluginOptions } from "./lib/config"
 
 function getConfig(sessionId: string): SlimConfig {
     return sessionConfigs.get(sessionId) || loadConfig()
@@ -177,6 +465,114 @@ export async function resolveModelContextLimit(ctx: any): Promise<number> {
 }
 
 let warnedContextLimitFallback = false
+
+// The model ref (`providerID/modelID`) each session's limit was resolved for.
+// Compared per request so a mid-session model switch re-resolves the window
+// instead of inheriting the one resolved at setup.
+const sessionModelRefs = new Map<string, string>()
+
+/**
+ * Normalise a model reference to a comparable `providerID/modelID` key.
+ *
+ * The v2 hook event carries `Model.Ref` = `{ id, providerID, variant }`, while
+ * the `ModelInfo` entries in `model.list()` use `modelID`. Both are accepted so
+ * one lookup path serves the event and the list, and a variant is deliberately
+ * ignored: a variant changes reasoning effort, not the context window.
+ */
+export function modelRefKey(ref: unknown): string | undefined {
+    if (!ref || typeof ref !== "object") return undefined
+    const r = ref as { providerID?: unknown; id?: unknown; modelID?: unknown }
+    const providerID = typeof r.providerID === "string" ? r.providerID : undefined
+    const modelID =
+        typeof r.id === "string"
+            ? r.id
+            : typeof r.modelID === "string"
+              ? r.modelID
+              : undefined
+    if (!providerID || !modelID) return undefined
+    return `${providerID}/${modelID}`
+}
+
+/**
+ * Resolve the context window for a specific model ref.
+ *
+ * `resolveModelContextLimit` answers "what is the DEFAULT model's window",
+ * which is correct once at setup and wrong forever after: a session that
+ * switches models keeps every percentage threshold pointed at the window of a
+ * model it is no longer running (200k → 1M still fires at 160k).
+ *
+ * The same exact-match rule applies — the named model's own entry, never an
+ * unrelated one (issue #11) — so a miss returns `undefined` and the caller
+ * keeps the limit it already had rather than borrowing a neighbour's window.
+ */
+export async function resolveModelContextLimitForRef(
+    ctx: any,
+    ref: unknown,
+): Promise<number | undefined> {
+    const key = modelRefKey(ref)
+    if (!key) return undefined
+    // Split the FIRST separator only, never with `split(sep, 2)`: a model id
+    // can itself contain slashes (`openrouter/meta-llama/llama-3-70b`), and a
+    // 2-element split silently truncates the tail, so such a model would never
+    // match its own list entry.
+    const sep = key.indexOf("/")
+    const providerID = key.slice(0, sep)
+    const modelID = key.slice(sep + 1)
+
+    let models: ModelLimitEntry[] = []
+    if (ctx?.model && typeof ctx.model.list === "function") {
+        try {
+            models = unwrapModelList(await ctx.model.list())
+        } catch {
+            // Unavailable list: keep the current limit rather than guessing.
+            return undefined
+        }
+    }
+
+    const found = models.find(
+        (m) => m?.providerID === providerID && (m?.modelID ?? undefined) === modelID,
+    )
+    return contextLimitOf(found)
+}
+
+/**
+ * Keep `sessionModelLimits` in step with the model each request actually runs
+ * against. Re-resolves only when the ref changes, so the steady-state cost is
+ * one string compare plus the `model.list()` read the change triggers.
+ *
+ * Returns the limit to use for this request. A failed re-resolution keeps the
+ * previous limit: a wrong-but-plausible window is worse than the window we
+ * already had.
+ */
+export async function syncModelLimitForSession(
+    ctx: any,
+    sessionId: string,
+    ref: unknown,
+    fallbackLimit: number,
+): Promise<number> {
+    const key = modelRefKey(ref)
+    if (!key || sessionModelRefs.get(sessionId) === key) {
+        return sessionModelLimits.get(sessionId) || fallbackLimit
+    }
+
+    const resolved = await resolveModelContextLimitForRef(ctx, ref)
+    const limit = resolved ?? sessionModelLimits.get(sessionId) ?? fallbackLimit
+
+    if (resolved !== undefined) {
+        // Record the ref ONLY on success. Marking a failed lookup as settled
+        // would latch the fallback in permanently: the next request would see
+        // the same key, short-circuit the re-resolution, and keep the wrong
+        // window for the rest of the session even after `model.list()` starts
+        // answering again. Not settled means "retry on the next request".
+        sessionModelRefs.set(sessionId, key)
+        sessionModelLimits.set(sessionId, limit)
+    }
+
+    if (getConfig(sessionId).debug) {
+        console.log(`[slim] model limit: session=${sessionId} ref=${key} limit=${limit}`)
+    }
+    return limit
+}
 
 /** Clear the warn-once guard (test hook). */
 export function resetContextLimitFallbackWarning(): void {
@@ -418,6 +814,16 @@ export default Plugin.define({
     id: "opencodev2-slim",
     async setup(ctx) {
         createDefaultConfig()
+        // Route session state through the host's plugin-scoped storage, keyed by
+        // project directory, so two checkouts no longer share one global
+        // ~/.config/opencode/slim directory. Falls back to that directory when
+        // the host exposes no storage domain.
+        configurePersistence(ctx)
+
+        // Options from the `plugins` array in opencode.jsonc, captured once per
+        // plugin load. `slim.jsonc` remains the fallback for every key the
+        // options object does not set.
+        configurePluginOptions(ctx)
 
         // Resolve the active model's real context limit once.
         // This drives accurate percentage-based thresholds instead of a hard-coded 200k.
@@ -509,7 +915,7 @@ export default Plugin.define({
                     const keepRecent = args.keepRecent || 5
                     const sessionId = context.sessionID
                     const config = getConfig(sessionId)
-                    const state = getState(sessionId, config)
+                    const state = await getState(sessionId, config)
 
                     try {
                         const messages = await ctx.session.context({ sessionID: sessionId })
@@ -629,7 +1035,7 @@ export default Plugin.define({
                             config.adaptive.learningRate,
                         )
 
-                        saveSessionState(state, config.persistence.directory)
+                        await persistState(state, config)
 
                         return {
                             content: `## Compressed ${targetMessages.length} messages\n\n${summary}\n\n---\n**Stats:** ${inputTokens} → ${outputTokens} tokens (${Math.round(ratio * 100)}% saved) | Mode: ${mode} | Focus: ${args.focus}${blockNote}`,
@@ -663,7 +1069,7 @@ export default Plugin.define({
                 execute: async (_input, context) => {
                     const sessionId = context.sessionID
                     const config = getConfig(sessionId)
-                    const state = getState(sessionId, config)
+                    const state = await getState(sessionId, config)
 
                     try {
                         // Pull the real, server-measured context usage for this session.
@@ -746,7 +1152,7 @@ export default Plugin.define({
                         )
 
                         const panel = renderPanel(panelData)
-                        saveSessionState(state, config.persistence.directory)
+                        await persistState(state, config)
                         return { content: panel }
                     } catch (error) {
                         return {
@@ -757,18 +1163,27 @@ export default Plugin.define({
             })
         })
 
-        // ─── System Prompt Hook (sync) ───────────────────────────────────
-        await ctx.session.hook("context", (event) => {
+        // ─── System Prompt Hook ───────────────────────────────────────────
+        // Async because the model window is re-resolved from `event.model`; the
+        // hook contract allows `Promise<void>`, and awaiting here keeps the
+        // published limits consistent with the context hook below.
+        hookRegistrations.push(await ctx.session.hook("context", async (event) => {
             const sessionId = event.sessionID
             const config = getConfig(sessionId)
             if (!config.enabled || !config.compress.enabled) return
 
-            const state = getState(sessionId, config)
-            // Use the resolved real model limit, falling back to a sane default.
-            state.modelContextLimit = sessionModelLimits.get(sessionId) || initialModelLimit
+            const state = await getState(sessionId, config)
+            // Same model-derived window as the context hook below, so the
+            // published limits never describe a model this session left behind.
+            state.modelContextLimit = await syncModelLimitForSession(
+                ctx,
+                sessionId,
+                event.model,
+                initialModelLimit,
+            )
 
             event.system.push({ type: "text", text: getSystemPrompt() })
-        })
+        }))
 
         // ─── Messages Transform Hook (sync → async) ─────────────────────────
         // DCP pipeline for every outgoing request: sync compression blocks,
@@ -776,13 +1191,22 @@ export default Plugin.define({
         // purge errored tool inputs + prune stale tool outputs), then apply DCP
         // limit rules as anchored nudges. Session history is never modified —
         // only this request.
-        await ctx.session.hook("context", async (event) => {
+        hookRegistrations.push(await ctx.session.hook("context", async (event) => {
             const sessionId = event.sessionID
             const config = getConfig(sessionId)
             if (!config.enabled) return
 
-            const state = getState(sessionId, config)
-            state.modelContextLimit = sessionModelLimits.get(sessionId) || initialModelLimit
+            const state = await getState(sessionId, config)
+            // The request itself names the model this session is running, so the
+            // window is resolved from `event.model` rather than from whatever the
+            // default model happened to be at setup — otherwise every percent
+            // threshold stays pinned to the old model after a mid-session switch.
+            state.modelContextLimit = await syncModelLimitForSession(
+                ctx,
+                sessionId,
+                event.model,
+                initialModelLimit,
+            )
 
             if (config.debug) {
                 console.log(`[slim] context hook: session=${sessionId}, messages=${event.messages.length}, modelLimit=${state.modelContextLimit}`)
@@ -1088,14 +1512,14 @@ export default Plugin.define({
                 console.log(`[slim] final messages: ${event.messages.length}, tokens: ${totalTokens}, limits: max=${limits.max} min=${limits.min}`)
             }
 
-            saveSessionState(state, config.persistence.directory)
-        })
+            await persistState(state, config)
+        }))
 
         // ─── Compaction Hook ────────────────────────────────────────────
         // Real, persistent context compression: when OpenCode compacts a session,
         // provide a structured summary so history actually shrinks (unlike the
         // `context` hook, which only affects the outgoing model request).
-        await ctx.session.hook("compaction", async (event) => {
+        hookRegistrations.push(await ctx.session.hook("compaction", async (event) => {
             const sessionId = (event as any).sessionID
             const config = getConfig(sessionId)
             if (!config.enabled || !config.compress.enabled) return
@@ -1103,8 +1527,16 @@ export default Plugin.define({
             const messages = (event as any).messages || []
             if (!messages.length) return
 
-            const state = getState(sessionId, config)
-            state.modelContextLimit = sessionModelLimits.get(sessionId) || initialModelLimit
+            const state = await getState(sessionId, config)
+            // A compaction request names its model too, so re-sync here as well:
+            // resolving thresholds during compaction against the previous
+            // model's window is the same staleness bug as in the context hook.
+            state.modelContextLimit = await syncModelLimitForSession(
+                ctx,
+                sessionId,
+                (event as any).model,
+                initialModelLimit,
+            )
 
             // Build a structured summary instead of just stringifying.
             const lines: string[] = []
@@ -1212,12 +1644,12 @@ export default Plugin.define({
                     },
                     config.adaptive.learningRate,
                 )
-                saveSessionState(state, config.persistence.directory)
+                await persistState(state, config)
             }
 
             // Record our own summary so OpenCode uses it instead of running the model.
             ;(event as any).result = { summary }
-        })
+        }))
 
         // ─── Event Subscription ──────────────────────────────────────────
         // A compaction rewrote history: the cached measurement describes a prompt
@@ -1240,8 +1672,13 @@ export default Plugin.define({
                     const sessionId = props.sessionID || ""
                     const config = getConfig(sessionId)
                     sessionConfigs.set(sessionId, config)
+                    // Seed only the fallback limit. The ref is deliberately left
+                    // unset so the first request re-resolves from its own
+                    // `event.model` — a session created while a non-default model
+                    // is active must not inherit the default model's window.
                     sessionModelLimits.set(sessionId, initialModelLimit)
-                    getState(sessionId, config)
+                    sessionModelRefs.delete(sessionId)
+                    await getState(sessionId, config)
                 } else if (event.type === "session.step.ended") {
                     // Real API billing for the step that just finished:
                     // { sessionID, assistantMessageID, finish, cost, tokens }.
@@ -1268,11 +1705,31 @@ export default Plugin.define({
         })()
 
         // ─── Cleanup ─────────────────────────────────────────────────────
-        return () => {
+        // Async because persistence now writes through ctx.storage; returning a
+        // promise lets the host await the final flush on reload/unload instead
+        // of the process exiting mid-write.
+        return async () => {
             eventController.abort()
+
+            // Detach the hooks BEFORE flushing state: a dispose can drop the
+            // last reference to the callbacks, and no request should run the
+            // pipeline against a half-torn-down plugin.
+            //
+            // Disposed one at a time and individually guarded, so one failing
+            // dispose cannot strand the other two — they would stay attached
+            // for the life of the host process.
+            while (hookRegistrations.length > 0) {
+                const registration = hookRegistrations.pop()!
+                try {
+                    await registration.dispose()
+                } catch (err) {
+                    console.warn("[slim] failed to dispose a session hook registration:", err)
+                }
+            }
+
             for (const [sessionId, state] of sessionStates.entries()) {
                 const config = getConfig(sessionId)
-                saveSessionState(state, config.persistence.directory)
+                await persistState(state, config)
             }
         }
     },
