@@ -639,6 +639,22 @@ export function applyCompressedRanges(
         }
         result.push(msg)
     }
+
+    // A summary is injected at its anchor, which can sit well after the removed
+    // head of the history. When the original history started with a user turn
+    // and the result no longer does, Anthropic rejects the request (the first
+    // tool_use is reported as lacking a tool_result). Hoist the first injected
+    // summary to the front; with none to hoist, send the request uncompressed
+    // rather than a history that starts mid-tool-loop.
+    const roleOf = (m: any) => m?.role ?? m?.type
+    if (removals.size > 0 && result.length > 0 && roleOf(messages[0]) === "user" && roleOf(result[0]) !== "user") {
+        const at = result.findIndex(
+            (m) => typeof m?.id === "string" && m.id.startsWith("slim-summary-") && roleOf(m) === "user",
+        )
+        if (at < 0) return messages
+        const [summary] = result.splice(at, 1)
+        result.unshift(summary)
+    }
     return result
 }
 
