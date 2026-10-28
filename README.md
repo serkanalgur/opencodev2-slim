@@ -499,6 +499,23 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 
 ## Changelog
 
+### 3.2.1
+
+**FIXES**
+
+- A compression block that removed the head of the history no longer produces a
+  request that starts mid-tool-loop. The summary is injected at its anchor,
+  which can sit well after the removed messages, so when the block covered the
+  original prompt the outgoing history began with an `assistant` turn holding a
+  `tool_use` and no user turn before it — Anthropic rejects that with
+  "`tool_use` ids were found without `tool_result` blocks immediately after",
+  and the stored block re-applied on every later request, so the session kept
+  failing. The first injected summary is now hoisted to the front whenever the
+  original history started with a user turn; if there is no summary to hoist,
+  the request goes out uncompressed rather than malformed. Reported and fixed
+  by [leandromqrs](https://github.com/leandromqrs) in
+  [#14](https://github.com/serkanalgur/opencodev2-slim/pull/14).
+
 ### 3.2.0
 
 **NEW**
@@ -900,6 +917,7 @@ Note: Compression is performed by the AI assistant using the `compress` tool. Th
 ## Credits
 
 - [PrakharSrivastav](https://github.com/PrakharSrivastav) — reported [issue #11](https://github.com/serkanalgur/opencodev2-slim/issues/11), suggesting that a context window should not be resolved by borrowing an arbitrary model's limit, and that current context usage should be measured per model call rather than read off session lifetime totals. Both suggestions shipped in 3.0.1.
+- [leandromqrs](https://github.com/leandromqrs) — reported and fixed [#14](https://github.com/serkanalgur/opencodev2-slim/pull/14): a compression block covering the first user turn left the outgoing history starting with an `assistant` `tool_use` and no user turn, which Anthropic rejects. Shipped in 3.2.1.
 
 ## License
 
